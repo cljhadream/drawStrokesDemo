@@ -13,6 +13,7 @@ object NativeBridge {
     external fun onNativeDrawFrame()
     external fun setViewScale(scale: Float)
     external fun setViewTransform(scale: Float, cx: Float, cy: Float)
+    external fun setDepthOcclusionEnabled(enabled: Boolean)
     /**
      * 设置渲染时每条笔划使用的最大点数（LOD）。
      * - 用于缩放手势进行中降低顶点负载，提升交互流畅度

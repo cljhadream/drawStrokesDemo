@@ -4,8 +4,6 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-buildDir = file("build5")
-
 android {
     namespace = "com.example.myapplication"
     compileSdk = 35

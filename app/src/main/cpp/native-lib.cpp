@@ -60,6 +60,7 @@ static int gDarkenStrokeCount = 0;
 static int gVisibleIndexCapacity = 0;
 static int gVisibleCount = 0;
 static std::atomic<int> gVisibleDirty{1};
+static std::atomic<int> gDepthOcclusionEnabled{1};
 
 // CPU侧元数据
 struct StrokeMetaCPU {
@@ -307,7 +308,7 @@ static void updateVisibleListIfNeeded() {
 
     float w = (float)g_Width;
     float h = (float)g_Height;
-    float pad = 16.0f * gViewScale;
+    float pad = 24.0f;
     if (w <= 0.0f || h <= 0.0f) {
         for (int i = 0; i < total; ++i) gVisibleIdsCPU.push_back((uint32_t)i);
     } else {
@@ -568,8 +569,8 @@ void main() {
     vec2 nStart = vec2(-dirStart.y, dirStart.x);
     vec2 nEnd = vec2(-dirEnd.y, dirEnd.x);
     // 线宽以屏幕像素为准，不随缩放变粗/变细
-    float r0 = metas[strokeId].baseWidth * pressures[start] * uViewScale * 0.5;
-    float rN = metas[strokeId].baseWidth * pressures[start + lastPointIdx] * uViewScale * 0.5;
+    float r0 = metas[strokeId].baseWidth * pressures[start] * 0.5;
+    float rN = metas[strokeId].baseWidth * pressures[start + lastPointIdx] * 0.5;
 
     int vid = gl_VertexID;
     if (vid < 0 || vid >= kTotalVerts) {
@@ -1137,9 +1138,14 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
     glClearDepthf(1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LESS);
-    glDepthMask(GL_TRUE);
+    if (gDepthOcclusionEnabled.load() != 0) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glDepthMask(GL_TRUE);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+    }
     glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
     
     if (!gProgram) return;
@@ -1240,7 +1246,7 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
         }
         int drawCount = (gVisibleIndexSSBO ? gVisibleCount : (gLiveActive ? totalStrokes : committedStrokes));
         if (drawCount > 0) {
-            if (uStrokeCountLoc >= 0) glUniform1f(uStrokeCountLoc, (float)std::max(drawCount, 1));
+            if (uStrokeCountLoc >= 0) glUniform1f(uStrokeCountLoc, (float)std::max(totalStrokes, 1));
             if (uBaseInstanceLoc >= 0) glUniform1f(uBaseInstanceLoc, 0.0f);
             const int vertsPerStroke = std::clamp(gRenderMaxPoints.load(), 1, 1024) * 2 + 8;
             glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, vertsPerStroke, drawCount);
@@ -1294,6 +1300,12 @@ Java_com_example_myapplication_NativeBridge_setViewTransform(JNIEnv* env, jobjec
 JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_setRenderMaxPoints(JNIEnv* env, jobject /*thiz*/, jint maxPoints) {
     gRenderMaxPoints.store(std::clamp((int)maxPoints, 1, 1024));
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_myapplication_NativeBridge_setDepthOcclusionEnabled(JNIEnv* env, jobject /*thiz*/, jboolean enabled) {
+    (void)env;
+    gDepthOcclusionEnabled.store(enabled ? 1 : 0);
 }
 
 JNIEXPORT void JNICALL
