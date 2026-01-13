@@ -50,6 +50,7 @@ static int gGlErrorLogBudget = 16;
 static std::atomic<int> gStrokeUploadLogBudget{8};
 static std::atomic<int> gBatchUploadLogBudget{8};
 static std::atomic<int> gQueueLogBudget{8};
+static std::atomic<int> gFirstFrameLogOnce{1};
 static bool gUseFramebufferFetch = false;
 static bool gUseFramebufferFetchEXT = false;
 static int gGestureStartStrokeId = -1;
@@ -407,11 +408,11 @@ void main() {
     int maxPoints = clamp(uRenderMaxPoints, 1, 1024);
     int kBodyVerts = maxPoints * 2;
     const int kStartCapVerts = 4;
-    const int kBodyStart = kStartCapVerts; // 4
-    const int kBodyEnd = kBodyStart + kBodyVerts; // 4 + 2048
-    const int kEndCapStart = kBodyEnd;
     const int kEndCapVerts = 4;
-    const int kTotalVerts = kBodyVerts + kStartCapVerts + kEndCapVerts; // 2048 + 8
+    int kBodyStart = kStartCapVerts; // 4
+    int kBodyEnd = kBodyStart + kBodyVerts; // 4 + 2048
+    int kEndCapStart = kBodyEnd;
+    int kTotalVerts = kBodyVerts + kStartCapVerts + kEndCapVerts; // 2048 + 8
 
     int lastPointIdx = max(count - 1, 0);
     vec2 p0Screen = positions[start] * uViewScale + uViewTranslate;
@@ -1012,6 +1013,19 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
     }
     if (uRenderMaxPointsLoc >= 0) {
         glUniform1i(uRenderMaxPointsLoc, std::clamp(gRenderMaxPoints.load(), 1, 1024));
+    }
+    if (gFirstFrameLogOnce.fetch_sub(1) > 0) {
+        LOGW("FirstFrame: useSSBO=%s framebufferFetch=%s scale=%.3f translate=(%.1f,%.1f) renderMaxPoints=%d committed=%d live=%s",
+             gUseSSBO ? "yes" : "no",
+             gUseFramebufferFetch ? "yes" : "no",
+             gViewScale,
+             gViewTranslateX, gViewTranslateY,
+             std::clamp(gRenderMaxPoints.load(), 1, 1024),
+             (int)gMetas.size(),
+             gLiveActive ? "yes" : "no");
+        if (!gUseSSBO) {
+            LOGW("FallbackActive: ES3.0 simple path draws GL_LINE_STRIP (likely 1px width)");
+        }
     }
     int committedStrokes = (int)gMetas.size();
     int totalStrokes = committedStrokes + (gLiveActive ? 1 : 0);
