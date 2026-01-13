@@ -1,3 +1,0 @@
-ninja: Entering directory `C:\Documents\Myproject\Android\HelloWorld\app\.cxx\Debug\3s4f185k\armeabi-v7a'
-[1/2] Building CXX object CMakeFiles/native-lib.dir/native-lib.cpp.o
-[2/2] Linking CXX shared library C:\Documents\Myproject\Android\HelloWorld\app\build5\intermediates\cxx\Debug\3s4f185k\obj\armeabi-v7a\libnative-lib.so
