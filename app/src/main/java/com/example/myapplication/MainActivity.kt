@@ -1,9 +1,15 @@
 package com.example.myapplication
 
 import android.os.Bundle
+import android.util.TypedValue
 import android.util.Log
+import android.view.Gravity
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.activity.ComponentActivity
 import kotlin.math.PI
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
@@ -12,13 +18,49 @@ import kotlin.math.sin
 class MainActivity : ComponentActivity() {
     private lateinit var glView: StrokeGLSurfaceView
     private var demoDrawn: Boolean = false
+    private lateinit var scaleLabel: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.d("MainActivity", "Creating StrokeGLSurfaceView...")
         glView = StrokeGLSurfaceView(this)
         Log.d("MainActivity", "Setting content view...")
-        setContentView(glView)
+        val root = FrameLayout(this)
+        root.layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+
+        val glParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        )
+        root.addView(glView, glParams)
+
+        scaleLabel = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            setBackgroundColor(0x80000000.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            val pad = dpToPx(8f)
+            setPadding(pad, pad, pad, pad)
+            text = "100%"
+        }
+        val labelParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.START or Gravity.TOP
+            val m = dpToPx(12f)
+            leftMargin = m
+            topMargin = m
+        }
+        root.addView(scaleLabel, labelParams)
+
+        glView.setOnViewScaleChangedListener { scale ->
+            scaleLabel.text = "${(scale * 100f).roundToInt()}%"
+        }
+
+        setContentView(root)
         Log.d("MainActivity", "Content view set")
     }
 
@@ -227,5 +269,13 @@ class MainActivity : ComponentActivity() {
         }
         
         return floatArrayOf(r1 + m, g1 + m, b1 + m)
+    }
+
+    private fun dpToPx(dp: Float): Int {
+        return TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            dp,
+            resources.displayMetrics
+        ).roundToInt()
     }
 }

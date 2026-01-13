@@ -18,6 +18,7 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
     private var translateX = 0.0f
     private var translateY = 0.0f
     private var suppressDrawUntilNextDown = false
+    private var onViewScaleChanged: ((Float) -> Unit)? = null
     private val input = StrokeInputProcessor(
         screenToWorld = { x, y ->
             val inv = 1.0f / currentScale.coerceAtLeast(1e-4f)
@@ -53,7 +54,7 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
             val focusY = detector.focusY
 
             val oldScale = currentScale
-            val newScale = (oldScale * factor).coerceIn(0.2f, 8.0f)
+            val newScale = (oldScale * factor).coerceIn(0.3f, 15.0f)
             if (newScale != oldScale) {
                 val focusWorldX = (focusX - translateX) / oldScale
                 val focusWorldY = (focusY - translateY) / oldScale
@@ -62,6 +63,7 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
                 currentScale = newScale
 
                 NativeBridge.setViewTransform(currentScale, translateX, translateY)
+                onViewScaleChanged?.invoke(currentScale)
             }
             return true
         }
@@ -90,6 +92,11 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
         
         // 强制设置视图可见性
         visibility = android.view.View.VISIBLE
+    }
+
+    fun setOnViewScaleChangedListener(listener: ((Float) -> Unit)?) {
+        onViewScaleChanged = listener
+        onViewScaleChanged?.invoke(currentScale)
     }
 
     private class MsaaConfigChooser : EGLConfigChooser {
