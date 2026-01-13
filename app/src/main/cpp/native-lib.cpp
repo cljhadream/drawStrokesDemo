@@ -60,7 +60,6 @@ static int gDarkenStrokeCount = 0;
 static int gVisibleIndexCapacity = 0;
 static int gVisibleCount = 0;
 static std::atomic<int> gVisibleDirty{1};
-static std::atomic<int> gDepthOcclusionEnabled{1};
 
 // CPU侧元数据
 struct StrokeMetaCPU {
@@ -78,7 +77,7 @@ struct StrokeBoundsCPU {
     float maxY;
 };
 static std::vector<StrokeBoundsCPU> gBounds;
-static std::vector<uint32_t> gVisibleIdsCPU;
+static std::vector<uint32_t> gVisiblePackedCPU;
 static int gAllocatedStrokes = 0;
 static bool gLiveActive = false;
 static StrokeMetaCPU gLiveMeta;
@@ -175,8 +174,8 @@ static void ensureCapacityForStrokes(size_t requiredStrokes) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
         gVisibleIndexSSBO = resizeBufferCopy(GL_SHADER_STORAGE_BUFFER,
                                              gVisibleIndexSSBO,
-                                             (GLsizeiptr)((size_t)oldCap * sizeof(uint32_t)),
-                                             (GLsizeiptr)((size_t)newCap * sizeof(uint32_t)));
+                                             (GLsizeiptr)((size_t)oldCap * sizeof(uint32_t) * 2u),
+                                             (GLsizeiptr)((size_t)newCap * sizeof(uint32_t) * 2u));
         gVisibleIndexCapacity = newCap;
     }
 
@@ -268,6 +267,17 @@ static StrokeBoundsCPU computeBoundsFromPoints(const float* pts, int n) {
     return b;
 }
 
+static int computeLodPointsFromScreenExtent(float extentPixels, int count) {
+    if (count <= 0) return 0;
+    int c = std::min(count, 1024);
+    if (c <= 16) return c;
+    float stepPx = 2.0f;
+    int lod = (int)std::ceil(extentPixels / stepPx) + 2;
+    if (lod < 16) lod = 16;
+    if (lod > c) lod = c;
+    return lod;
+}
+
 static void ensureVisibleIndexCapacity(int required) {
     if (!gUseSSBO || !gVisibleIndexSSBO) return;
     if (required <= 0) return;
@@ -278,12 +288,12 @@ static void ensureVisibleIndexCapacity(int required) {
     }
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
     if (gVisibleIndexCapacity <= 0) {
-        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)((size_t)newCap * sizeof(uint32_t)), nullptr, GL_DYNAMIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)((size_t)newCap * sizeof(uint32_t) * 2u), nullptr, GL_DYNAMIC_DRAW);
     } else {
         gVisibleIndexSSBO = resizeBufferCopy(GL_SHADER_STORAGE_BUFFER,
                                              gVisibleIndexSSBO,
-                                             (GLsizeiptr)((size_t)gVisibleIndexCapacity * sizeof(uint32_t)),
-                                             (GLsizeiptr)((size_t)newCap * sizeof(uint32_t)));
+                                             (GLsizeiptr)((size_t)gVisibleIndexCapacity * sizeof(uint32_t) * 2u),
+                                             (GLsizeiptr)((size_t)newCap * sizeof(uint32_t) * 2u));
     }
     gVisibleIndexCapacity = newCap;
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
@@ -296,21 +306,33 @@ static void updateVisibleListIfNeeded() {
     int committed = (int)gMetas.size();
     int total = committed + (gLiveActive ? 1 : 0);
     if (total <= 0) {
-        gVisibleIdsCPU.clear();
+        gVisiblePackedCPU.clear();
         gVisibleCount = 0;
         gVisibleDirty.store(0);
         return;
     }
 
     ensureVisibleIndexCapacity(total);
-    gVisibleIdsCPU.clear();
-    gVisibleIdsCPU.reserve((size_t)total);
+    gVisiblePackedCPU.clear();
+    gVisiblePackedCPU.reserve((size_t)total * 2u);
 
     float w = (float)g_Width;
     float h = (float)g_Height;
     float pad = 24.0f;
     if (w <= 0.0f || h <= 0.0f) {
-        for (int i = 0; i < total; ++i) gVisibleIdsCPU.push_back((uint32_t)i);
+        int globalMax = std::clamp(gRenderMaxPoints.load(), 1, 1024);
+        for (int i = 0; i < committed; ++i) {
+            int count = gMetas[(size_t)i].count;
+            if (count <= 0) continue;
+            uint32_t lod = (uint32_t)std::min(std::min(count, 1024), globalMax);
+            gVisiblePackedCPU.push_back((uint32_t)i);
+            gVisiblePackedCPU.push_back(lod);
+        }
+        if (gLiveActive && gLiveMeta.count > 0) {
+            uint32_t lod = (uint32_t)std::min(std::min(gLiveMeta.count, 1024), globalMax);
+            gVisiblePackedCPU.push_back((uint32_t)committed);
+            gVisiblePackedCPU.push_back(lod);
+        }
     } else {
         int boundsN = (int)gBounds.size();
         int n = std::min(committed, boundsN);
@@ -325,14 +347,23 @@ static void updateVisibleListIfNeeded() {
             if (minX - pad > w) continue;
             if (maxY + pad < 0.0f) continue;
             if (minY - pad > h) continue;
-            gVisibleIdsCPU.push_back((uint32_t)i);
+            float dx = std::max(0.0f, maxX - minX);
+            float dy = std::max(0.0f, maxY - minY);
+            float extent = std::sqrt(dx * dx + dy * dy);
+            int lodI = computeLodPointsFromScreenExtent(extent, gMetas[(size_t)i].count);
+            if (lodI <= 0) continue;
+            gVisiblePackedCPU.push_back((uint32_t)i);
+            gVisiblePackedCPU.push_back((uint32_t)lodI);
         }
         for (int i = n; i < committed; ++i) {
             if (gMetas[(size_t)i].count <= 0) continue;
-            gVisibleIdsCPU.push_back((uint32_t)i);
+            int lodI = std::min(gMetas[(size_t)i].count, 1024);
+            gVisiblePackedCPU.push_back((uint32_t)i);
+            gVisiblePackedCPU.push_back((uint32_t)lodI);
         }
         if (gLiveActive) {
             bool vis = true;
+            int lodLive = std::min(gLiveMeta.count, 1024);
             if (gHasLiveBounds) {
                 const StrokeBoundsCPU& b = gLiveBounds;
                 float minX = b.minX * gViewScale + gViewTranslateX;
@@ -343,15 +374,22 @@ static void updateVisibleListIfNeeded() {
                 if (minX - pad > w) vis = false;
                 if (maxY + pad < 0.0f) vis = false;
                 if (minY - pad > h) vis = false;
+                float dx = std::max(0.0f, maxX - minX);
+                float dy = std::max(0.0f, maxY - minY);
+                float extent = std::sqrt(dx * dx + dy * dy);
+                lodLive = computeLodPointsFromScreenExtent(extent, gLiveMeta.count);
             }
-            if (vis) gVisibleIdsCPU.push_back((uint32_t)committed);
+            if (vis && lodLive > 0) {
+                gVisiblePackedCPU.push_back((uint32_t)committed);
+                gVisiblePackedCPU.push_back((uint32_t)lodLive);
+            }
         }
     }
 
-    gVisibleCount = (int)gVisibleIdsCPU.size();
+    gVisibleCount = (int)(gVisiblePackedCPU.size() / 2u);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
     if (gVisibleCount > 0) {
-        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)((size_t)gVisibleCount * sizeof(uint32_t)), gVisibleIdsCPU.data());
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)((size_t)gVisibleCount * sizeof(uint32_t) * 2u), gVisiblePackedCPU.data());
     }
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
     gVisibleDirty.store(0);
@@ -491,7 +529,7 @@ layout(std430, binding=0) buffer StrokeMetaBuf {
 
 layout(std430, binding=1) buffer PositionsBuf { vec2 positions[]; };
 layout(std430, binding=2) buffer PressuresBuf { float pressures[]; };
-layout(std430, binding=3) buffer VisibleIndexBuf { uint visibleIds[]; };
+layout(std430, binding=3) buffer VisibleIndexBuf { uint visiblePacked[]; };
 
 uniform vec2 uResolution;
 uniform float uViewScale;
@@ -528,11 +566,28 @@ void setOffscreen() {
     vCapSign = 0.0;
 }
 
+void setDegenerateAtScreen(vec2 anchorScreen) {
+    vec2 ndc;
+    ndc.x = (anchorScreen.x / uResolution.x) * 2.0 - 1.0;
+    ndc.y = 1.0 - (anchorScreen.y / uResolution.y) * 2.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    vColor = vec4(0.0);
+    vEffect = 0.0;
+    vMode = 0.0;
+    vEdgeSigned = 0.0;
+    vHalfWidth = 0.0;
+    vCapLocal = vec2(0.0);
+    vCapRadius = 0.0;
+    vCapSign = 0.0;
+}
+
 void main() {
     vec3 dummy = aStrictCheckBypass * 0.000001;
     
     int visibleIndex = gl_InstanceID + int(uBaseInstance);
-    int strokeId = int(visibleIds[visibleIndex]);
+    int base = visibleIndex * 2;
+    int strokeId = int(visiblePacked[base + 0]);
+    int lodPoints = int(visiblePacked[base + 1]);
 
     int start = metas[strokeId].start;
     int count = metas[strokeId].count;
@@ -550,7 +605,7 @@ void main() {
     // 基于uRenderMaxPoints动态决定本实例输出的三角带顶点数：
     // - 笔身：每个采样点输出左右两个边缘点 -> 2 * maxPoints
     // - 端帽：起点与终点各输出4个点，形成半圆/方形过渡
-    int maxPoints = clamp(uRenderMaxPoints, 1, 1024);
+    int maxPoints = clamp(min(lodPoints, uRenderMaxPoints), 1, 1024);
     int kBodyVerts = maxPoints * 2;
     const int kStartCapVerts = 4;
     const int kEndCapVerts = 4;
@@ -568,14 +623,18 @@ void main() {
     vec2 dirEnd = safeNormalize(pNScreen - pN1Screen);
     vec2 nStart = vec2(-dirStart.y, dirStart.x);
     vec2 nEnd = vec2(-dirEnd.y, dirEnd.x);
-    // 线宽以屏幕像素为准，不随缩放变粗/变细
-    float r0 = metas[strokeId].baseWidth * pressures[start] * 0.5;
-    float rN = metas[strokeId].baseWidth * pressures[start + lastPointIdx] * 0.5;
+    float r0 = metas[strokeId].baseWidth * pressures[start] * uViewScale * 0.5;
+    float rN = metas[strokeId].baseWidth * pressures[start + lastPointIdx] * uViewScale * 0.5;
 
     int vid = gl_VertexID;
-    if (vid < 0 || vid >= kTotalVerts) {
+    bool degenerateTail = false;
+    if (vid < 0) {
         setOffscreen();
         return;
+    }
+    if (vid >= kTotalVerts) {
+        vid = kTotalVerts - 1;
+        degenerateTail = true;
     }
 
     vec2 posScreen = vec2(0.0);
@@ -614,7 +673,7 @@ void main() {
     } else if (vid < kBodyEnd) {
         // 笔身：用采样点的法线偏移构造左右边界，转角处用miter限制避免尖刺过长
         if (count <= 1) {
-            setOffscreen();
+            setDegenerateAtScreen(p0Screen);
             return;
         }
         int bodyVid = vid - kBodyStart;
@@ -692,7 +751,7 @@ void main() {
     } else {
         // 结束端帽：以终点为中心，沿笔迹方向生成端部几何
         if (count <= 1) {
-            setOffscreen();
+            setDegenerateAtScreen(p0Screen);
             return;
         }
         int capVid = vid - kEndCapStart;
@@ -717,11 +776,17 @@ void main() {
     vec2 ndc;
     ndc.x = (posScreen.x / uResolution.x) * 2.0 - 1.0;
     ndc.y = 1.0 - (posScreen.y / uResolution.y) * 2.0;
-    // 使用strokeId生成稳定的深度顺序，尽量避免大量笔划相互覆盖时的闪烁
-    float t = (float(strokeId) + 0.5) / max(uStrokeCount, 1.0);
-    float depth01 = 1.0 - t;
-    float zNdc = depth01 * 2.0 - 1.0;
-    gl_Position = vec4(ndc, zNdc, 1.0);
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    if (degenerateTail) {
+        vColor = vec4(0.0);
+        vEffect = 0.0;
+        vMode = 0.0;
+        vEdgeSigned = 0.0;
+        vHalfWidth = 0.0;
+        vCapLocal = vec2(0.0);
+        vCapRadius = 0.0;
+        vCapSign = 0.0;
+    }
 }
 )";
 
@@ -934,10 +999,8 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
     LOGW("GL Renderer: %s", glGetString(GL_RENDERER));
     LOGW("GL Vendor: %s", glGetString(GL_VENDOR));
     LOGW("GL Version: %s", glGetString(GL_VERSION));
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LESS);
-    glDepthMask(GL_TRUE);
-    glClearDepthf(1.0f);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);
     glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
 
@@ -1093,7 +1156,7 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
         glGenBuffers(1, &gVisibleIndexSSBO);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
         gVisibleIndexCapacity = gAllocatedStrokes + 1;
-        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)((size_t)gVisibleIndexCapacity * sizeof(uint32_t)), nullptr, GL_DYNAMIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)((size_t)gVisibleIndexCapacity * sizeof(uint32_t) * 2u), nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
         gVisibleDirty.store(1);
     }
@@ -1135,17 +1198,9 @@ JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobject /*thiz*/) {
     while (glGetError() != GL_NO_ERROR) {}
     glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-    glClearDepthf(1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    
-    if (gDepthOcclusionEnabled.load() != 0) {
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LESS);
-        glDepthMask(GL_TRUE);
-    } else {
-        glDisable(GL_DEPTH_TEST);
-        glDepthMask(GL_FALSE);
-    }
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
     glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
     
     if (!gProgram) return;
@@ -1300,12 +1355,6 @@ Java_com_example_myapplication_NativeBridge_setViewTransform(JNIEnv* env, jobjec
 JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_setRenderMaxPoints(JNIEnv* env, jobject /*thiz*/, jint maxPoints) {
     gRenderMaxPoints.store(std::clamp((int)maxPoints, 1, 1024));
-}
-
-JNIEXPORT void JNICALL
-Java_com_example_myapplication_NativeBridge_setDepthOcclusionEnabled(JNIEnv* env, jobject /*thiz*/, jboolean enabled) {
-    (void)env;
-    gDepthOcclusionEnabled.store(enabled ? 1 : 0);
 }
 
 JNIEXPORT void JNICALL
