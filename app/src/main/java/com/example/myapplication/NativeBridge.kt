@@ -13,6 +13,12 @@ object NativeBridge {
     external fun onNativeDrawFrame()
     external fun setViewScale(scale: Float)
     external fun setViewTransform(scale: Float, cx: Float, cy: Float)
+    /**
+     * 设置渲染时每条笔划使用的最大点数（LOD）。
+     * - 用于缩放手势进行中降低顶点负载，提升交互流畅度
+     * - 取值范围：1..1024
+     */
+    external fun setRenderMaxPoints(maxPoints: Int)
     external fun beginLiveStroke(color: FloatArray)
     external fun updateLiveStroke(points: FloatArray, pressures: FloatArray)
     external fun updateLiveStrokeWithCount(points: FloatArray, pressures: FloatArray, count: Int)

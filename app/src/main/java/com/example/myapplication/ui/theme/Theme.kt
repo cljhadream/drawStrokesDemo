@@ -34,9 +34,13 @@ private val LightColorScheme = lightColorScheme(
 )
 
 @Composable
+/**
+ * 应用主题入口（Compose 模板代码）。
+ * 当前 Demo 的主渲染界面使用 GLSurfaceView，本主题文件通常仅用于模板保留与后续扩展。
+ */
 fun MyApplicationTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    // Dynamic color is available on Android 12+
+    // 动态配色仅在 Android 12+ 可用
     dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {

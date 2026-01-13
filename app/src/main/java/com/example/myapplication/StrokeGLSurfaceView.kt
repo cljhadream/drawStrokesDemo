@@ -14,6 +14,10 @@ import javax.microedition.khronos.egl.EGLDisplay
 class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
     private val renderer = NativeRenderer()
     private val batcher = StrokeBatcher()
+
+    // 视图变换参数：
+    // - currentScale：世界坐标到屏幕坐标的缩放因子（用于无损矢量缩放）
+    // - translateX/translateY：屏幕空间平移（以像素为单位），实现以手势焦点为中心缩放
     private var currentScale = 1.0f
     private var translateX = 0.0f
     private var translateY = 0.0f
@@ -21,6 +25,7 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
     private var onViewScaleChanged: ((Float) -> Unit)? = null
     private val input = StrokeInputProcessor(
         screenToWorld = { x, y ->
+            // 将屏幕坐标反变换到世界坐标，确保缩放/平移时仍能正确采集笔迹点
             val inv = 1.0f / currentScale.coerceAtLeast(1e-4f)
             floatArrayOf((x - translateX) * inv, (y - translateY) * inv)
         },
@@ -54,21 +59,35 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
             val focusY = detector.focusY
 
             val oldScale = currentScale
+            // 缩放范围：30% - 1500%
             val newScale = (oldScale * factor).coerceIn(0.3f, 15.0f)
             if (newScale != oldScale) {
+                // 保持缩放焦点不漂移：先把焦点从屏幕映射回旧世界坐标，再换算到新屏幕坐标求出平移量
                 val focusWorldX = (focusX - translateX) / oldScale
                 val focusWorldY = (focusY - translateY) / oldScale
                 translateX = focusX - focusWorldX * newScale
                 translateY = focusY - focusWorldY * newScale
                 currentScale = newScale
 
+                // 仅更新视图变换参数，避免在 Kotlin 层做任何重建/重采样
                 NativeBridge.setViewTransform(currentScale, translateX, translateY)
                 onViewScaleChanged?.invoke(currentScale)
             }
             return true
         }
         override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+            queueEvent {
+                // 缩放手势进行中启用低LOD：显著降低每条笔划参与渲染的点数，优先保证交互流畅
+                NativeBridge.setRenderMaxPoints(256)
+            }
             return true
+        }
+
+        override fun onScaleEnd(detector: ScaleGestureDetector) {
+            queueEvent {
+                // 手势结束恢复全量渲染，保证最终静止画面质量
+                NativeBridge.setRenderMaxPoints(1024)
+            }
         }
     })
 

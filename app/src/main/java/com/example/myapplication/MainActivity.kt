@@ -13,7 +13,10 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
- * 主界面，创建并显示GLSurfaceView用于OpenGL ES渲染。
+ * 主界面：
+ * - 底层为 GLSurfaceView 承载 OpenGL ES 渲染
+ * - 左上角叠加显示当前缩放比例（用于调试/性能测试时直观确认缩放状态）
+ * - 首次进入时自动生成大量测试笔划用于压测
  */
 class MainActivity : ComponentActivity() {
     private lateinit var glView: StrokeGLSurfaceView
@@ -31,12 +34,14 @@ class MainActivity : ComponentActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT
         )
 
+        // 先把 GL 视图作为底层内容
         val glParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
         )
         root.addView(glView, glParams)
 
+        // 再叠加一个轻量的文本标签显示缩放百分比（避免引入复杂UI框架影响渲染侧调试）
         scaleLabel = TextView(this).apply {
             setTextColor(0xFFFFFFFF.toInt())
             setBackgroundColor(0x80000000.toInt())
@@ -79,7 +84,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 绘制1万条测试笔划，用于性能测试。
+     * 绘制10万条测试笔划，用于性能测试。
      * 生成不同颜色、位置和形状的线条来测试渲染性能。
      */
     private fun drawDemoStroke() {
@@ -87,8 +92,8 @@ class MainActivity : ComponentActivity() {
         val w = dm.widthPixels.toFloat()
         val h = dm.heightPixels.toFloat()
         
-        // 生成10条线条，用于测试平滑效果
-        val totalStrokeCount = 10
+        // 生成10万条线条，用于测试性能
+        val totalStrokeCount = 100_000
         val pointsPerStroke = 1024
         val batchSize = 5000 // 每批5000条线，避免内存溢出
         val totalBatches = (totalStrokeCount + batchSize - 1) / batchSize

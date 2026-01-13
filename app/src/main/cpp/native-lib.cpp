@@ -6,6 +6,7 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 
 #define LOG_TAG "NativeLib"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -35,10 +36,12 @@ static GLint uStrokeCountLoc = -1;
 static GLint uBaseInstanceLoc = -1;
 static GLint uMaxPointSizeLoc = -1;
 static GLint uPassLoc = -1;
+static GLint uRenderMaxPointsLoc = -1;
 static float gViewScale = 1.0f;
 static float gViewTranslateX = 0.0f;
 static float gViewTranslateY = 0.0f;
 static float gMaxPointSize = 64.0f;
+static std::atomic<int> gRenderMaxPoints{1024};
 static GLint uColorLoc = -1;     // 回退路径使用的颜色uniform
 static bool gUseSSBO = true;     // 根据GL版本决定是否使用SSBO路径
 static bool gHasVertexHalfFloat = false; // 是否支持顶点属性使用half浮点
@@ -300,6 +303,27 @@ static void uploadStroke(const std::vector<float>& pts,
 }
 
 static const char* kVS = R"(#version 310 es
+// 顶点着色器（ES 3.1+ / SSBO路径）
+// 目标：在一次 glDrawArraysInstanced 调用中绘制所有笔划。
+//
+// 绘制模型：
+// - 每个实例（gl_InstanceID）代表一条笔划（stroke）。
+// - 每个实例内部用一个 TRIANGLE_STRIP 生成「起始端帽 + 笔身 + 结束端帽」的三角带。
+// - gl_VertexID 代表该实例内的顶点编号，用于决定当前顶点属于端帽还是笔身，以及笔身对应的采样点与左右侧。
+//
+// 数据来源（SSBO）：
+// - binding=0: metas[]        每条笔划的元数据（起始索引、点数、基础宽度、颜色、效果标记）。
+// - binding=1: positions[]    所有笔划的点坐标（像素坐标，按笔划连续存储）。
+// - binding=2: pressures[]    所有点的压力（与positions[]一一对应）。
+//
+// 视图变换：
+// - 坐标：screen = positions * uViewScale + uViewTranslate
+// - 宽度：radius = baseWidth * pressure * uViewScale * 0.5
+//
+// LOD（缩放手势期间降采样）：
+// - uRenderMaxPoints 控制每条笔划参与绘制的最大采样点数。
+// - 当真实点数 count 很大时，按均匀采样将 [0..count-1] 映射到 [0..uRenderMaxPoints-1]，
+//   显著降低顶点数量，提升缩放期间的交互流畅度。
 layout(location=0) in vec3 aStrictCheckBypass;
 
 struct StrokeMeta {
@@ -324,6 +348,7 @@ uniform float uMaxPointSize;
 uniform float uStrokeCount;
 uniform float uBaseInstance;
 uniform int uPass;
+uniform int uRenderMaxPoints;
 
 out highp vec4 vColor;
 out highp float vEffect;
@@ -360,13 +385,20 @@ void main() {
     int count = metas[strokeId].count;
     float effect = metas[strokeId].pad;
     vEffect = effect;
+    // 分两次渲染时，用 effect 作为笔划分组标记：
+    // - uPass==0：绘制 effect<=0.5 的笔划
+    // - uPass==1：绘制 effect>0.5 的笔划
+    // - uPass==2：不分组，直接绘制全部
     if ((uPass == 0 && effect > 0.5) || (uPass == 1 && effect <= 0.5) || count <= 0) {
         setOffscreen();
         return;
     }
 
-    const int kMaxPoints = 1024;
-    const int kBodyVerts = kMaxPoints * 2;
+    // 基于uRenderMaxPoints动态决定本实例输出的三角带顶点数：
+    // - 笔身：每个采样点输出左右两个边缘点 -> 2 * maxPoints
+    // - 端帽：起点与终点各输出4个点，形成半圆/方形过渡
+    int maxPoints = clamp(uRenderMaxPoints, 1, 1024);
+    int kBodyVerts = maxPoints * 2;
     const int kStartCapVerts = 4;
     const int kBodyStart = kStartCapVerts; // 4
     const int kBodyEnd = kBodyStart + kBodyVerts; // 4 + 2048
@@ -402,6 +434,7 @@ void main() {
     vColor = metas[strokeId].color;
 
     if (vid < kStartCapVerts) {
+        // 起始端帽：以起点为中心，在笔迹方向的反向生成端部几何
         vec2 center = p0Screen;
         float r = r0;
         vec2 dir = dirStart;
@@ -425,6 +458,7 @@ void main() {
         vCapRadius = r;
         vCapSign = sign;
     } else if (vid < kBodyEnd) {
+        // 笔身：用采样点的法线偏移构造左右边界，转角处用miter限制避免尖刺过长
         if (count <= 1) {
             setOffscreen();
             return;
@@ -433,14 +467,18 @@ void main() {
         int pointIdx = bodyVid >> 1;
         int side = (bodyVid & 1) == 0 ? -1 : 1;
 
-        int clampedPoint = min(pointIdx, lastPointIdx);
+        // 均匀采样：将 [0..maxPoints-1] 映射到 [0..lastPointIdx]
+        int denom = max(maxPoints - 1, 1);
+        int clampedPoint = min((pointIdx * lastPointIdx) / denom, lastPointIdx);
         int idx = start + clampedPoint;
         vec2 pCurScreen = positions[idx] * uViewScale + uViewTranslate;
         float pressure = pressures[idx];
         float radius = metas[strokeId].baseWidth * pressure * uViewScale * 0.5;
 
-        int prevPointIdx = max(clampedPoint - 1, 0);
-        int nextPointIdx = min(clampedPoint + 1, lastPointIdx);
+        int prevSampleIdx = max(pointIdx - 1, 0);
+        int nextSampleIdx = min(pointIdx + 1, maxPoints - 1);
+        int prevPointIdx = min((prevSampleIdx * lastPointIdx) / denom, lastPointIdx);
+        int nextPointIdx = min((nextSampleIdx * lastPointIdx) / denom, lastPointIdx);
         vec2 pPrevScreen = positions[start + prevPointIdx] * uViewScale + uViewTranslate;
         vec2 pNextScreen = positions[start + nextPointIdx] * uViewScale + uViewTranslate;
 
@@ -488,10 +526,12 @@ void main() {
         float halfWidth = radius * edgeLen;
         vec2 offset = edgeN * (halfWidth * sideSign);
         posScreen = pCurScreen + offset;
+        // 向片元着色器输出“有符号边缘距离”，用于抗锯齿过渡（笔身）
         vEdgeSigned = sideSign * halfWidth;
         vHalfWidth = halfWidth;
         vMode = 0.0;
     } else {
+        // 结束端帽：以终点为中心，沿笔迹方向生成端部几何
         if (count <= 1) {
             setOffscreen();
             return;
@@ -518,6 +558,7 @@ void main() {
     vec2 ndc;
     ndc.x = (posScreen.x / uResolution.x) * 2.0 - 1.0;
     ndc.y = 1.0 - (posScreen.y / uResolution.y) * 2.0;
+    // 使用strokeId生成稳定的深度顺序，尽量避免大量笔划相互覆盖时的闪烁
     float t = (float(strokeId) + 0.5) / max(uStrokeCount, 1.0);
     float depth01 = 1.0 - t;
     float zNdc = depth01 * 2.0 - 1.0;
@@ -527,6 +568,11 @@ void main() {
 
 static const char* kFS = R"(#version 310 es
 precision highp float;
+
+// 片元着色器（ES 3.1+ / SSBO路径）
+// - vMode==0：笔身，使用vEdgeSigned与vHalfWidth做抗锯齿边缘过渡
+// - vMode==1：端帽，使用SDF圆/半平面裁剪做抗锯齿过渡
+// 输出为预乘alpha：rgb已乘以alpha，便于与GL_ONE/GL_ONE_MINUS_SRC_ALPHA配合
 
 in highp vec4 vColor;
 in highp float vEffect;
@@ -541,10 +587,12 @@ out vec4 fragColor;
 
 void main() {
     if (vColor.a <= 0.0) discard;
+    // 笔身抗锯齿：把“到边缘的距离”映射成平滑alpha
     float aaBody = max(fwidth(vEdgeSigned) * 1.5, 1.0);
     float hw = max(vHalfWidth, 0.0);
     float alphaBody = 1.0 - smoothstep(hw - 0.5 * aaBody, hw + 0.5 * aaBody, abs(vEdgeSigned));
 
+    // 端帽抗锯齿：SDF圆 + 可选半平面裁剪（控制半圆/方形端帽的形状）
     float sdfCircle = length(vCapLocal) - vCapRadius;
     float sdf = sdfCircle;
     if (abs(vCapSign) > 0.5) {
@@ -564,6 +612,9 @@ void main() {
 static const char* kFS_fetch_EXT = R"(#version 310 es
 #extension GL_EXT_shader_framebuffer_fetch : require
 precision highp float;
+
+// 帧缓冲读取版本（EXT）：在片元中读取目标颜色并做自定义混合
+// 目的：避免启用固定管线混合，在大量笔划叠加时减少带宽与状态切换开销
 
 in highp vec4 vColor;
 in highp float vEffect;
@@ -594,18 +645,22 @@ void main() {
     float useCap = step(0.5, vMode);
     float alpha = mix(alphaBody, alphaCap, useCap);
 
+    // 源颜色：预乘alpha
     float Sa = vColor.a * alpha;
     vec3 S = vColor.rgb;
     vec3 Sp = S * Sa;
 
+    // 目标颜色：预乘alpha（由framebuffer fetch提供）
     vec4 dst = fragColor;
     float Da = dst.a;
     vec3 Dp = dst.rgb;
 
+    // 默认混合：out = S + D*(1-Sa)
     vec3 outRGB = Sp + Dp * (1.0 - Sa);
     float outA = Sa + Da * (1.0 - Sa);
 
     if (vEffect > 0.5) {
+        // “加深/暗化”效果：对非预乘的目标色做min混合，再回写为预乘
         vec3 Du = Dp / max(Da, 1e-6);
         vec3 B = min(Du, S);
         outRGB = Dp * (1.0 - Sa) + Sp * (1.0 - Da) + (Sa * Da) * B;
@@ -618,6 +673,8 @@ void main() {
 static const char* kFS_fetch_ARM = R"(#version 310 es
 #extension GL_ARM_shader_framebuffer_fetch : require
 precision highp float;
+
+// 帧缓冲读取版本（ARM）：逻辑与EXT版本一致，但读取接口不同
 
 in highp vec4 vColor;
 in highp float vEffect;
@@ -660,6 +717,7 @@ void main() {
     float outA = Sa + Da * (1.0 - Sa);
 
     if (vEffect > 0.5) {
+        // “加深/暗化”效果：对非预乘的目标色做min混合，再回写为预乘
         vec3 Du = Dp / max(Da, 1e-6);
         vec3 B = min(Du, S);
         outRGB = Dp * (1.0 - Sa) + Sp * (1.0 - Da) + (Sa * Da) * B;
@@ -822,6 +880,7 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
     uBaseInstanceLoc = glGetUniformLocation(gProgram, "uBaseInstance");
     uMaxPointSizeLoc = glGetUniformLocation(gProgram, "uMaxPointSize");
     uPassLoc = glGetUniformLocation(gProgram, "uPass");
+    uRenderMaxPointsLoc = glGetUniformLocation(gProgram, "uRenderMaxPoints");
     uColorLoc = glGetUniformLocation(gProgram, "uColor");
 
     // VAO与缓冲
@@ -940,6 +999,9 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
     if (uMaxPointSizeLoc >= 0) {
         glUniform1f(uMaxPointSizeLoc, gMaxPointSize);
     }
+    if (uRenderMaxPointsLoc >= 0) {
+        glUniform1i(uRenderMaxPointsLoc, std::clamp(gRenderMaxPoints.load(), 1, 1024));
+    }
     int committedStrokes = (int)gMetas.size();
     int totalStrokes = committedStrokes + (gLiveActive ? 1 : 0);
 
@@ -1001,7 +1063,8 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
         if (drawCount > 0) {
             if (uStrokeCountLoc >= 0) glUniform1f(uStrokeCountLoc, (float)std::max(drawCount, 1));
             if (uBaseInstanceLoc >= 0) glUniform1f(uBaseInstanceLoc, 0.0f);
-            glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, kVertsPerStroke, drawCount);
+            const int vertsPerStroke = std::clamp(gRenderMaxPoints.load(), 1, 1024) * 2 + 8;
+            glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, vertsPerStroke, drawCount);
         }
     } else {
         glEnable(GL_BLEND);
@@ -1045,6 +1108,11 @@ Java_com_example_myapplication_NativeBridge_setViewTransform(JNIEnv* env, jobjec
     gViewScale = (scale < 1e-4f) ? 1e-4f : scale;
     gViewTranslateX = cx;
     gViewTranslateY = cy;
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_myapplication_NativeBridge_setRenderMaxPoints(JNIEnv* env, jobject /*thiz*/, jint maxPoints) {
+    gRenderMaxPoints.store(std::clamp((int)maxPoints, 1, 1024));
 }
 
 JNIEXPORT void JNICALL
