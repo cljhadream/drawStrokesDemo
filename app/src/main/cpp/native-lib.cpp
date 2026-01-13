@@ -10,6 +10,7 @@
 
 #define LOG_TAG "NativeLib"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 static int g_Width = 0;
@@ -46,6 +47,9 @@ static GLint uColorLoc = -1;     // 回退路径使用的颜色uniform
 static bool gUseSSBO = true;     // 根据GL版本决定是否使用SSBO路径
 static bool gHasVertexHalfFloat = false; // 是否支持顶点属性使用half浮点
 static int gGlErrorLogBudget = 16;
+static std::atomic<int> gStrokeUploadLogBudget{8};
+static std::atomic<int> gBatchUploadLogBudget{8};
+static std::atomic<int> gQueueLogBudget{8};
 static bool gUseFramebufferFetch = false;
 static bool gUseFramebufferFetchEXT = false;
 static int gGestureStartStrokeId = -1;
@@ -298,8 +302,10 @@ static void uploadStroke(const std::vector<float>& pts,
     float firstY = posWrite.size() >= 2 ? posWrite[1] : 0.0f;
     float lastX = (N >= 1) ? posWrite[(N - 1) * 2] : 0.0f;
     float lastY = (N >= 1) ? posWrite[(N - 1) * 2 + 1] : 0.0f;
-    LOGI("addStroke(uploaded): id=%d, count=%d width=%.1f color=(%.2f,%.2f,%.2f,%.2f) first=(%.1f,%.1f) last=(%.1f,%.1f)",
-         strokeId, N, meta.baseWidth, col[0], col[1], col[2], col[3], firstX, firstY, lastX, lastY);
+    if (gStrokeUploadLogBudget.fetch_sub(1) > 0) {
+        LOGI("addStroke(uploaded): id=%d, count=%d width=%.1f color=(%.2f,%.2f,%.2f,%.2f) first=(%.1f,%.1f) last=(%.1f,%.1f)",
+             strokeId, N, meta.baseWidth, col[0], col[1], col[2], col[3], firstX, firstY, lastX, lastY);
+    }
 }
 
 static const char* kVS = R"(#version 310 es
@@ -318,7 +324,8 @@ static const char* kVS = R"(#version 310 es
 //
 // 视图变换：
 // - 坐标：screen = positions * uViewScale + uViewTranslate
-// - 宽度：radius = baseWidth * pressure * uViewScale * 0.5
+// - 宽度：为保持“物理粗细”不随缩放变化，宽度不跟随uViewScale缩放：
+//         radius = baseWidth * pressure * 0.5
 //
 // LOD（缩放手势期间降采样）：
 // - uRenderMaxPoints 控制每条笔划参与绘制的最大采样点数。
@@ -415,6 +422,7 @@ void main() {
     vec2 dirEnd = safeNormalize(pNScreen - pN1Screen);
     vec2 nStart = vec2(-dirStart.y, dirStart.x);
     vec2 nEnd = vec2(-dirEnd.y, dirEnd.x);
+    // 线宽以屏幕像素为准，不随缩放变粗/变细
     float r0 = metas[strokeId].baseWidth * pressures[start] * uViewScale * 0.5;
     float rN = metas[strokeId].baseWidth * pressures[start + lastPointIdx] * uViewScale * 0.5;
 
@@ -473,6 +481,7 @@ void main() {
         int idx = start + clampedPoint;
         vec2 pCurScreen = positions[idx] * uViewScale + uViewTranslate;
         float pressure = pressures[idx];
+        // 修复：笔身宽度也需要随视图缩放，否则会变成细线
         float radius = metas[strokeId].baseWidth * pressure * uViewScale * 0.5;
 
         int prevSampleIdx = max(pointIdx - 1, 0);
@@ -484,6 +493,10 @@ void main() {
 
         vec2 dirPrev = safeNormalize(pCurScreen - pPrevScreen);
         vec2 dirNext = safeNormalize(pNextScreen - pCurScreen);
+
+        // 修复：LOD模式下起点和终点的邻居重合导致切线计算错误
+        if (pointIdx == 0) dirPrev = dirNext;
+        if (pointIdx == maxPoints - 1) dirNext = dirPrev;
 
         vec2 nPrev = vec2(-dirPrev.y, dirPrev.x);
         vec2 nNext = vec2(-dirNext.y, dirNext.x);
@@ -772,9 +785,9 @@ extern "C" {
 JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, jobject /*thiz*/) {
     // 初始化基本状态
-    LOGI("GL Renderer: %s", glGetString(GL_RENDERER));
-    LOGI("GL Vendor: %s", glGetString(GL_VENDOR));
-    LOGI("GL Version: %s", glGetString(GL_VERSION));
+    LOGW("GL Renderer: %s", glGetString(GL_RENDERER));
+    LOGW("GL Vendor: %s", glGetString(GL_VENDOR));
+    LOGW("GL Version: %s", glGetString(GL_VERSION));
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
     glDepthMask(GL_TRUE);
@@ -789,30 +802,28 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
         GLint maxSsboBindings = 0;
         glGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, &maxVertexSsbo);
         glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &maxSsboBindings);
-        gUseSSBO = (maxVertexSsbo >= 3 && maxSsboBindings >= 3);
-        if (gUseSSBO) {
-            GLuint vs = compileShader(GL_VERTEX_SHADER, kVS);
-            GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFS);
-            gProgram = linkProgram2(vs, fs);
-            if (!gProgram) {
-                gUseSSBO = false;
-                GLuint fvs = compileShader(GL_VERTEX_SHADER, kVS_simple);
-                GLuint ffs = compileShader(GL_FRAGMENT_SHADER, kFS_simple);
-                gProgram = linkProgram2(fvs, ffs);
-                LOGI("Fallback: SSBO shader compile/link failed");
-            }
+
+        // 一些设备对上面两个上限的返回值可能偏保守；这里改为“先尝试编译SSBO版本”，
+        // 只有在编译/链接失败时才回退到ES3.0的简化线段绘制路径。
+        gUseSSBO = true;
+        GLuint vs = compileShader(GL_VERTEX_SHADER, kVS);
+        GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFS);
+        gProgram = linkProgram2(vs, fs);
+        if (!gProgram) {
+            gUseSSBO = false;
+            GLuint fvs = compileShader(GL_VERTEX_SHADER, kVS_simple);
+            GLuint ffs = compileShader(GL_FRAGMENT_SHADER, kFS_simple);
+            gProgram = linkProgram2(fvs, ffs);
+            LOGW("Fallback: SSBO shader compile/link failed (vertexBlocks=%d bindings=%d)", maxVertexSsbo, maxSsboBindings);
         } else {
-            GLuint vs = compileShader(GL_VERTEX_SHADER, kVS_simple);
-            GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFS_simple);
-            gProgram = linkProgram2(vs, fs);
-            LOGI("Fallback: SSBO limits insufficient (vertexBlocks=%d bindings=%d)", maxVertexSsbo, maxSsboBindings);
+            LOGW("SSBO path enabled (vertexBlocks=%d bindings=%d)", maxVertexSsbo, maxSsboBindings);
         }
     } else {
         gUseSSBO = false;
         GLuint vs = compileShader(GL_VERTEX_SHADER, kVS_simple);
         GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFS_simple);
         gProgram = linkProgram2(vs, fs);
-        LOGI("Fallback: using ES3.0 simple shader path");
+        LOGW("Fallback: using ES3.0 simple shader path");
     }
     if (gUseSSBO) {
         glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
@@ -826,8 +837,8 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
     GLfloat pointRange[2] = {0.0f, 0.0f};
     glGetFloatv(GL_ALIASED_POINT_SIZE_RANGE, pointRange);
     if (pointRange[1] > 0.0f) gMaxPointSize = pointRange[1];
-    LOGI("EGL depth bits: %d, useSSBO: %s", depthBits, gUseSSBO ? "yes" : "no");
-    LOGI("Point size range: %.1f .. %.1f", pointRange[0], pointRange[1]);
+    LOGW("EGL depth bits: %d, useSSBO: %s", depthBits, gUseSSBO ? "yes" : "no");
+    LOGW("Point size range: %.1f .. %.1f", pointRange[0], pointRange[1]);
 
     if (!gDebugProgram) {
         GLuint dvs = compileShader(GL_VERTEX_SHADER, kVS_debug);
@@ -852,7 +863,7 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
         if (strcmp(ext, "GL_EXT_shader_framebuffer_fetch") == 0) hasFetchEXT = true;
         if (strcmp(ext, "GL_ARM_shader_framebuffer_fetch") == 0) hasFetchARM = true;
     }
-    LOGI("Vertex half-float supported: %s", gHasVertexHalfFloat ? "yes" : "no");
+    LOGW("Vertex half-float supported: %s", gHasVertexHalfFloat ? "yes" : "no");
 
     if (gUseSSBO && gProgram && (hasFetchEXT || hasFetchARM)) {
         GLuint vs = compileShader(GL_VERTEX_SHADER, kVS);
@@ -954,7 +965,7 @@ JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_onNativeSurfaceChanged(JNIEnv* env, jobject /*thiz*/, jint width, jint height) {
     g_Width = width; g_Height = height;
     glViewport(0, 0, g_Width, g_Height);
-    LOGI("Surface changed: %dx%d", g_Width, g_Height);
+    LOGW("Surface changed: %dx%d", g_Width, g_Height);
     if (gProgram) {
         glUseProgram(gProgram);
         glUniform2f(uResolutionLoc, (float)g_Width, (float)g_Height);
@@ -1367,7 +1378,9 @@ Java_com_example_myapplication_NativeBridge_addStroke(JNIEnv* env, jobject /*thi
         ps.pressures = std::move(prs);
         ps.color = std::move(col);
         gPendingStrokes.push_back(std::move(ps));
-        LOGI("addStroke queued (GL not ready): count=%d", N);
+        if (gQueueLogBudget.fetch_sub(1) > 0) {
+            LOGW("addStroke queued (GL not ready): count=%d", N);
+        }
         return;
     }
 
@@ -1435,7 +1448,9 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
             ps.color = { colsFlat[s * 4 + 0], colsFlat[s * 4 + 1], colsFlat[s * 4 + 2], colsFlat[s * 4 + 3] };
             gPendingStrokes.push_back(std::move(ps));
         }
-        LOGI("addStrokeBatch queued (GL not ready): strokes=%d", (int)cntLen);
+        if (gQueueLogBudget.fetch_sub(1) > 0) {
+            LOGW("addStrokeBatch queued (GL not ready): strokes=%d", (int)cntLen);
+        }
         return;
     }
 
@@ -1559,7 +1574,9 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
                         metasBatch.data());
     }
 
-    LOGI("addStrokeBatch(uploaded): strokes=%d totalPoints=%d startId=%d", S, totalPoints, startId);
+    if (gBatchUploadLogBudget.fetch_sub(1) > 0) {
+        LOGI("addStrokeBatch(uploaded): strokes=%d totalPoints=%d startId=%d", S, totalPoints, startId);
+    }
 }
 
 }
