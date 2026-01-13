@@ -7,6 +7,7 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 
 #define LOG_TAG "NativeLib"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -30,6 +31,7 @@ static GLuint gPointsBuffer = 0;    // VBO: half(x,y,pressure)
 static GLuint gPositionsSSBO = 0;   // SSBO(binding=1): float32 vec2 positions
 static GLuint gStrokeMetaSSBO = 0;  // SSBO(binding=0): stroke metadata
 static GLuint gPressuresSSBO = 0;  // SSBO(binding=2): float32 pressures
+static GLuint gVisibleIndexSSBO = 0; // SSBO(binding=3): visible stroke id list
 static GLint uResolutionLoc = -1;
 static GLint uViewScaleLoc = -1;
 static GLint uViewTranslateLoc = -1;
@@ -55,6 +57,9 @@ static bool gUseFramebufferFetch = false;
 static bool gUseFramebufferFetchEXT = false;
 static int gGestureStartStrokeId = -1;
 static int gDarkenStrokeCount = 0;
+static int gVisibleIndexCapacity = 0;
+static int gVisibleCount = 0;
+static std::atomic<int> gVisibleDirty{1};
 
 // CPU侧元数据
 struct StrokeMetaCPU {
@@ -65,9 +70,19 @@ struct StrokeMetaCPU {
     float color[4];
 };
 static std::vector<StrokeMetaCPU> gMetas;
+struct StrokeBoundsCPU {
+    float minX;
+    float minY;
+    float maxX;
+    float maxY;
+};
+static std::vector<StrokeBoundsCPU> gBounds;
+static std::vector<uint32_t> gVisibleIdsCPU;
 static int gAllocatedStrokes = 0;
 static bool gLiveActive = false;
 static StrokeMetaCPU gLiveMeta;
+static StrokeBoundsCPU gLiveBounds{0.0f, 0.0f, 0.0f, 0.0f};
+static bool gHasLiveBounds = false;
 static float gLiveColor[4] = {0.1f, 0.4f, 1.0f, 0.85f};
 
 // 当GL程序尚未就绪时暂存的笔划，待初始化完成后统一上传
@@ -151,6 +166,18 @@ static void ensureCapacityForStrokes(size_t requiredStrokes) {
                                            (GLsizeiptr)((size_t)gAllocatedStrokes * sizeof(StrokeMetaCPU)),
                                            (GLsizeiptr)(newAlloc * sizeof(StrokeMetaCPU)));
     }
+    if (gUseSSBO && gVisibleIndexSSBO) {
+        int oldCap = gVisibleIndexCapacity;
+        int newCap = (int)newAlloc + 1;
+        if (oldCap < 1) oldCap = gAllocatedStrokes + 1;
+        if (newCap < 1) newCap = 1;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
+        gVisibleIndexSSBO = resizeBufferCopy(GL_SHADER_STORAGE_BUFFER,
+                                             gVisibleIndexSSBO,
+                                             (GLsizeiptr)((size_t)oldCap * sizeof(uint32_t)),
+                                             (GLsizeiptr)((size_t)newCap * sizeof(uint32_t)));
+        gVisibleIndexCapacity = newCap;
+    }
 
     gAllocatedStrokes = (int)newAlloc;
     LOGI("Buffers grown: strokes=%d pointsCap=%zu", gAllocatedStrokes, newPointsCap);
@@ -216,6 +243,117 @@ static GLuint linkProgram2(GLuint vs, GLuint fs) {
         return 0;
     }
     return p;
+}
+
+static StrokeBoundsCPU computeBoundsFromPoints(const float* pts, int n) {
+    StrokeBoundsCPU b{0.0f, 0.0f, 0.0f, 0.0f};
+    if (!pts || n <= 0) return b;
+    float minX = pts[0];
+    float maxX = pts[0];
+    float minY = pts[1];
+    float maxY = pts[1];
+    for (int i = 1; i < n; ++i) {
+        float x = pts[i * 2 + 0];
+        float y = pts[i * 2 + 1];
+        minX = std::min(minX, x);
+        minY = std::min(minY, y);
+        maxX = std::max(maxX, x);
+        maxY = std::max(maxY, y);
+    }
+    b.minX = minX;
+    b.minY = minY;
+    b.maxX = maxX;
+    b.maxY = maxY;
+    return b;
+}
+
+static void ensureVisibleIndexCapacity(int required) {
+    if (!gUseSSBO || !gVisibleIndexSSBO) return;
+    if (required <= 0) return;
+    if (required <= gVisibleIndexCapacity) return;
+    int newCap = gVisibleIndexCapacity > 0 ? gVisibleIndexCapacity : 1;
+    while (newCap < required) {
+        newCap = newCap < 16384 ? newCap * 2 : (int)(newCap * 1.5f);
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
+    if (gVisibleIndexCapacity <= 0) {
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)((size_t)newCap * sizeof(uint32_t)), nullptr, GL_DYNAMIC_DRAW);
+    } else {
+        gVisibleIndexSSBO = resizeBufferCopy(GL_SHADER_STORAGE_BUFFER,
+                                             gVisibleIndexSSBO,
+                                             (GLsizeiptr)((size_t)gVisibleIndexCapacity * sizeof(uint32_t)),
+                                             (GLsizeiptr)((size_t)newCap * sizeof(uint32_t)));
+    }
+    gVisibleIndexCapacity = newCap;
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
+}
+
+static void updateVisibleListIfNeeded() {
+    if (!gUseSSBO || !gVisibleIndexSSBO) return;
+    if (gVisibleDirty.load() == 0) return;
+
+    int committed = (int)gMetas.size();
+    int total = committed + (gLiveActive ? 1 : 0);
+    if (total <= 0) {
+        gVisibleIdsCPU.clear();
+        gVisibleCount = 0;
+        gVisibleDirty.store(0);
+        return;
+    }
+
+    ensureVisibleIndexCapacity(total);
+    gVisibleIdsCPU.clear();
+    gVisibleIdsCPU.reserve((size_t)total);
+
+    float w = (float)g_Width;
+    float h = (float)g_Height;
+    float pad = 16.0f * gViewScale;
+    if (w <= 0.0f || h <= 0.0f) {
+        for (int i = 0; i < total; ++i) gVisibleIdsCPU.push_back((uint32_t)i);
+    } else {
+        int boundsN = (int)gBounds.size();
+        int n = std::min(committed, boundsN);
+        for (int i = 0; i < n; ++i) {
+            if (gMetas[(size_t)i].count <= 0) continue;
+            const StrokeBoundsCPU& b = gBounds[(size_t)i];
+            float minX = b.minX * gViewScale + gViewTranslateX;
+            float maxX = b.maxX * gViewScale + gViewTranslateX;
+            float minY = b.minY * gViewScale + gViewTranslateY;
+            float maxY = b.maxY * gViewScale + gViewTranslateY;
+            if (maxX + pad < 0.0f) continue;
+            if (minX - pad > w) continue;
+            if (maxY + pad < 0.0f) continue;
+            if (minY - pad > h) continue;
+            gVisibleIdsCPU.push_back((uint32_t)i);
+        }
+        for (int i = n; i < committed; ++i) {
+            if (gMetas[(size_t)i].count <= 0) continue;
+            gVisibleIdsCPU.push_back((uint32_t)i);
+        }
+        if (gLiveActive) {
+            bool vis = true;
+            if (gHasLiveBounds) {
+                const StrokeBoundsCPU& b = gLiveBounds;
+                float minX = b.minX * gViewScale + gViewTranslateX;
+                float maxX = b.maxX * gViewScale + gViewTranslateX;
+                float minY = b.minY * gViewScale + gViewTranslateY;
+                float maxY = b.maxY * gViewScale + gViewTranslateY;
+                if (maxX + pad < 0.0f) vis = false;
+                if (minX - pad > w) vis = false;
+                if (maxY + pad < 0.0f) vis = false;
+                if (minY - pad > h) vis = false;
+            }
+            if (vis) gVisibleIdsCPU.push_back((uint32_t)committed);
+        }
+    }
+
+    gVisibleCount = (int)gVisibleIdsCPU.size();
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
+    if (gVisibleCount > 0) {
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)((size_t)gVisibleCount * sizeof(uint32_t)), gVisibleIdsCPU.data());
+    }
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
+    gVisibleDirty.store(0);
 }
 
 // 将一条笔划上传到GPU缓冲，并更新CPU侧元数据
@@ -295,6 +433,9 @@ static void uploadStroke(const std::vector<float>& pts,
     meta.pad = 0.0f;
     meta.color[0] = col[0]; meta.color[1] = col[1]; meta.color[2] = col[2]; meta.color[3] = col[3];
     gMetas.push_back(meta);
+    StrokeBoundsCPU bounds = computeBoundsFromPoints(pts.data(), N);
+    if ((int)gBounds.size() < strokeId) gBounds.resize((size_t)strokeId);
+    gBounds.push_back(bounds);
     if (gUseSSBO) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, gStrokeMetaSSBO);
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)(strokeId * sizeof(StrokeMetaCPU)), (GLsizeiptr)sizeof(StrokeMetaCPU), &meta);
@@ -307,6 +448,7 @@ static void uploadStroke(const std::vector<float>& pts,
         LOGI("addStroke(uploaded): id=%d, count=%d width=%.1f color=(%.2f,%.2f,%.2f,%.2f) first=(%.1f,%.1f) last=(%.1f,%.1f)",
              strokeId, N, meta.baseWidth, col[0], col[1], col[2], col[3], firstX, firstY, lastX, lastY);
     }
+    gVisibleDirty.store(1);
 }
 
 static const char* kVS = R"(#version 310 es
@@ -348,6 +490,7 @@ layout(std430, binding=0) buffer StrokeMetaBuf {
 
 layout(std430, binding=1) buffer PositionsBuf { vec2 positions[]; };
 layout(std430, binding=2) buffer PressuresBuf { float pressures[]; };
+layout(std430, binding=3) buffer VisibleIndexBuf { uint visibleIds[]; };
 
 uniform vec2 uResolution;
 uniform float uViewScale;
@@ -387,7 +530,8 @@ void setOffscreen() {
 void main() {
     vec3 dummy = aStrictCheckBypass * 0.000001;
     
-    int strokeId = gl_InstanceID + int(uBaseInstance);
+    int visibleIndex = gl_InstanceID + int(uBaseInstance);
+    int strokeId = int(visibleIds[visibleIndex]);
 
     int start = metas[strokeId].start;
     int count = metas[strokeId].count;
@@ -944,6 +1088,13 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, gPressuresSSBO);
         glBufferData(GL_SHADER_STORAGE_BUFFER, pointsCapacity * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, gPressuresSSBO);
+
+        glGenBuffers(1, &gVisibleIndexSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
+        gVisibleIndexCapacity = gAllocatedStrokes + 1;
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)((size_t)gVisibleIndexCapacity * sizeof(uint32_t)), nullptr, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
+        gVisibleDirty.store(1);
     }
     LOGI("Allocated buffers: strokes=%d, maxPointsPerStroke=%d, positions=%zu bytes, pressures=%zu bytes, vbo=%zu bytes",
          gAllocatedStrokes, kMaxPointsPerStroke,
@@ -976,6 +1127,7 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceChanged(JNIEnv* env, 
         gViewTranslateY = 0.0f;
         if (uViewTranslateLoc >= 0) glUniform2f(uViewTranslateLoc, gViewTranslateX, gViewTranslateY);
     }
+    gVisibleDirty.store(1);
 }
 
 JNIEXPORT void JNICALL
@@ -1031,10 +1183,12 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
     int totalStrokes = committedStrokes + (gLiveActive ? 1 : 0);
 
     if (gUseSSBO) {
+        updateVisibleListIfNeeded();
         glBindVertexArray(gEmptyVAO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, gStrokeMetaSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gPositionsSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, gPressuresSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
         if (gGlErrorLogBudget > 0) {
             GLenum e = glGetError();
             if (e != GL_NO_ERROR) {
@@ -1084,7 +1238,7 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
             glEnable(GL_BLEND);
             glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         }
-        int drawCount = gLiveActive ? totalStrokes : committedStrokes;
+        int drawCount = (gVisibleIndexSSBO ? gVisibleCount : (gLiveActive ? totalStrokes : committedStrokes));
         if (drawCount > 0) {
             if (uStrokeCountLoc >= 0) glUniform1f(uStrokeCountLoc, (float)std::max(drawCount, 1));
             if (uBaseInstanceLoc >= 0) glUniform1f(uBaseInstanceLoc, 0.0f);
@@ -1126,6 +1280,7 @@ JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_setViewScale(JNIEnv* env, jobject /*thiz*/, jfloat scale) {
     // 防止除零或过小值导致视觉异常
     gViewScale = (scale < 1e-4f) ? 1e-4f : scale;
+    gVisibleDirty.store(1);
 }
 
 JNIEXPORT void JNICALL
@@ -1133,6 +1288,7 @@ Java_com_example_myapplication_NativeBridge_setViewTransform(JNIEnv* env, jobjec
     gViewScale = (scale < 1e-4f) ? 1e-4f : scale;
     gViewTranslateX = cx;
     gViewTranslateY = cy;
+    gVisibleDirty.store(1);
 }
 
 JNIEXPORT void JNICALL
@@ -1155,6 +1311,8 @@ Java_com_example_myapplication_NativeBridge_beginLiveStroke(JNIEnv* env, jobject
     gLiveMeta.color[1] = gLiveColor[1];
     gLiveMeta.color[2] = gLiveColor[2];
     gLiveMeta.color[3] = gLiveColor[3];
+    gHasLiveBounds = false;
+    gVisibleDirty.store(1);
 }
 
 JNIEXPORT void JNICALL
@@ -1175,6 +1333,8 @@ Java_com_example_myapplication_NativeBridge_updateLiveStroke(JNIEnv* env, jobjec
     std::vector<float> prs((size_t)N);
     env->GetFloatArrayRegion(points, 0, N * 2, pts.data());
     env->GetFloatArrayRegion(pressures, 0, N, prs.data());
+    gLiveBounds = computeBoundsFromPoints(pts.data(), N);
+    gHasLiveBounds = true;
 
     int strokeId = (int)gMetas.size();
     ensureCapacityForStrokes((size_t)strokeId + 1u);
@@ -1245,6 +1405,7 @@ Java_com_example_myapplication_NativeBridge_updateLiveStroke(JNIEnv* env, jobjec
                         (GLsizeiptr)sizeof(StrokeMetaCPU),
                         &meta);
     }
+    gVisibleDirty.store(1);
 }
 
 JNIEXPORT void JNICALL
@@ -1264,6 +1425,8 @@ Java_com_example_myapplication_NativeBridge_updateLiveStrokeWithCount(JNIEnv* en
     std::vector<float> prs((size_t)N);
     env->GetFloatArrayRegion(points, 0, N * 2, pts.data());
     env->GetFloatArrayRegion(pressures, 0, N, prs.data());
+    gLiveBounds = computeBoundsFromPoints(pts.data(), N);
+    gHasLiveBounds = true;
 
     int strokeId = (int)gMetas.size();
     ensureCapacityForStrokes((size_t)strokeId + 1u);
@@ -1334,6 +1497,7 @@ Java_com_example_myapplication_NativeBridge_updateLiveStrokeWithCount(JNIEnv* en
                         (GLsizeiptr)sizeof(StrokeMetaCPU),
                         &meta);
     }
+    gVisibleDirty.store(1);
 }
 
 JNIEXPORT void JNICALL
@@ -1364,6 +1528,8 @@ Java_com_example_myapplication_NativeBridge_endLiveStroke(JNIEnv* env, jobject /
     gGestureStartStrokeId = -1;
     gLiveActive = false;
     gLiveMeta.count = 0;
+    gHasLiveBounds = false;
+    gVisibleDirty.store(1);
 }
 
 JNIEXPORT void JNICALL
@@ -1399,6 +1565,7 @@ Java_com_example_myapplication_NativeBridge_addStroke(JNIEnv* env, jobject /*thi
     }
 
     uploadStroke(pts, prs, col);
+    gVisibleDirty.store(1);
 }
 
 JNIEXPORT jint JNICALL
@@ -1501,6 +1668,7 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
     if (gHasVertexHalfFloat) vboBatch16.resize(blockPts * 3, 0);
     else vboBatchF.resize(blockPts * 3, 0.0f);
     std::vector<StrokeMetaCPU> metasBatch; metasBatch.reserve(S);
+    if ((int)gBounds.size() < startId) gBounds.resize((size_t)startId);
 
     int pi = 0, pri = 0;
     int totalPoints = 0;
@@ -1509,10 +1677,21 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
         int n = nOrig < 0 ? 0 : (nOrig > kMaxPointsPerStroke ? kMaxPointsPerStroke : nOrig);
         totalPoints += n;
         size_t base = (size_t)s * kMaxPointsPerStroke;
+        float minX = 0.0f, minY = 0.0f, maxX = 0.0f, maxY = 0.0f;
+        if (n > 0) {
+            minX = maxX = ptsFlat[pi + 0];
+            minY = maxY = ptsFlat[pi + 1];
+        }
         for (int i = 0; i < n; ++i) {
             float x = ptsFlat[pi + i * 2 + 0];
             float y = ptsFlat[pi + i * 2 + 1];
             float pr = prsFlat[pri + i];
+            if (i > 0) {
+                minX = std::min(minX, x);
+                minY = std::min(minY, y);
+                maxX = std::max(maxX, x);
+                maxY = std::max(maxY, y);
+            }
             positionsBatch[(base + i) * 2 + 0] = x;
             positionsBatch[(base + i) * 2 + 1] = y;
             pressuresBatch[base + i] = pr;
@@ -1539,6 +1718,9 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
         m.color[3] = colsFlat[s * 4 + 3];
         metasBatch.push_back(m);
         gMetas.push_back(m);
+
+        StrokeBoundsCPU b{minX, minY, maxX, maxY};
+        gBounds.push_back(b);
     }
 
     // 确保容量足够（可能增长并复制旧数据）
@@ -1591,6 +1773,7 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
     if (gBatchUploadLogBudget.fetch_sub(1) > 0) {
         LOGI("addStrokeBatch(uploaded): strokes=%d totalPoints=%d startId=%d", S, totalPoints, startId);
     }
+    gVisibleDirty.store(1);
 }
 
 }
