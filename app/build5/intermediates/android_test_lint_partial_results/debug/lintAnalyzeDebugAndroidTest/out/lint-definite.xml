@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<incidents format="6" by="lint 8.9.1" type="incidents">
+
+    <incident
+        id="GradleDependency"
+        severity="warning"
+        message="A newer version of androidx.core:core-ktx than 1.10.1 is available: 1.15.0">
+        <fix-replace
+            description="Change to 1.15.0"
+            family="Update versions"
+            oldString="1.10.1"
+            replacement="1.15.0"
+            priority="0"/>
+        <location
+            file="../gradle/libs.versions.toml"
+            line="4"
+            column="11"
+            startOffset="53"
+            endLine="4"
+            endColumn="19"
+            endOffset="61"/>
+    </incident>
+
+    <incident
+        id="GradleDependency"
+        severity="warning"
+        message="A newer version of androidx.test.ext:junit than 1.1.5 is available: 1.2.1">
+        <fix-replace
+            description="Change to 1.2.1"
+            family="Update versions"
+            oldString="1.1.5"
+            replacement="1.2.1"
+            priority="0"/>
+        <location
+            file="../gradle/libs.versions.toml"
+            line="6"
+            column="16"
+            startOffset="94"
+            endLine="6"
+            endColumn="23"
+            endOffset="101"/>
+    </incident>
+
+    <incident
+        id="GradleDependency"
+        severity="warning"
+        message="A newer version of androidx.test.espresso:espresso-core than 3.5.1 is available: 3.6.1">
+        <fix-replace
+            description="Change to 3.6.1"
+            family="Update versions"
+            oldString="3.5.1"
+            replacement="3.6.1"
+            priority="0"/>
+        <location
+            file="../gradle/libs.versions.toml"
+            line="7"
+            column="16"
+            startOffset="117"
+            endLine="7"
+            endColumn="23"
+            endOffset="124"/>
+    </incident>
+
+    <incident
+        id="GradleDependency"
+        severity="warning"
+        message="A newer version of androidx.activity:activity-compose than 1.8.0 is available: 1.8.2">
+        <fix-replace
+            description="Change to 1.8.2"
+            family="Update versions"
+            oldString="1.8.0"
+            replacement="1.8.2"
+            priority="0"/>
+        <location
+            file="../gradle/libs.versions.toml"
+            line="9"
+            column="19"
+            startOffset="173"
+            endLine="9"
+            endColumn="26"
+            endOffset="180"/>
+    </incident>
+
+</incidents>
