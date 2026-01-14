@@ -60,6 +60,9 @@ static int gDarkenStrokeCount = 0;
 static int gVisibleIndexCapacity = 0;
 static int gVisibleCount = 0;
 static std::atomic<int> gVisibleDirty{1};
+static std::atomic<int> gIsInteracting{0};
+static std::atomic<int64_t> gLastInteractionMs{0};
+static std::atomic<int> gProgressCount{0};
 
 // CPU侧元数据
 struct StrokeMetaCPU {
@@ -299,6 +302,14 @@ static void ensureVisibleIndexCapacity(int required) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
 }
 
+static int computeBaseProgressBudget() {
+    return gIsInteracting.load() != 0 ? 800 : 2000;
+}
+
+static void resetProgress() {
+    gProgressCount.store(computeBaseProgressBudget());
+}
+
 static void updateVisibleListIfNeeded() {
     if (!gUseSSBO || !gVisibleIndexSSBO) return;
     if (gVisibleDirty.load() == 0) return;
@@ -313,8 +324,13 @@ static void updateVisibleListIfNeeded() {
     }
 
     ensureVisibleIndexCapacity(total);
-    gVisiblePackedCPU.clear();
-    gVisiblePackedCPU.reserve((size_t)total * 2u);
+    struct VisibleItem {
+        uint32_t strokeId;
+        uint32_t lod;
+        float score;
+    };
+    std::vector<VisibleItem> items;
+    items.reserve((size_t)total);
 
     float w = (float)g_Width;
     float h = (float)g_Height;
@@ -325,13 +341,11 @@ static void updateVisibleListIfNeeded() {
             int count = gMetas[(size_t)i].count;
             if (count <= 0) continue;
             uint32_t lod = (uint32_t)std::min(std::min(count, 1024), globalMax);
-            gVisiblePackedCPU.push_back((uint32_t)i);
-            gVisiblePackedCPU.push_back(lod);
+            items.push_back(VisibleItem{(uint32_t)i, lod, 0.0f});
         }
         if (gLiveActive && gLiveMeta.count > 0) {
             uint32_t lod = (uint32_t)std::min(std::min(gLiveMeta.count, 1024), globalMax);
-            gVisiblePackedCPU.push_back((uint32_t)committed);
-            gVisiblePackedCPU.push_back(lod);
+            items.push_back(VisibleItem{(uint32_t)committed, lod, 0.0f});
         }
     } else {
         int boundsN = (int)gBounds.size();
@@ -352,18 +366,23 @@ static void updateVisibleListIfNeeded() {
             float extent = std::sqrt(dx * dx + dy * dy);
             int lodI = computeLodPointsFromScreenExtent(extent, gMetas[(size_t)i].count);
             if (lodI <= 0) continue;
-            gVisiblePackedCPU.push_back((uint32_t)i);
-            gVisiblePackedCPU.push_back((uint32_t)lodI);
+            float cx = (minX + maxX) * 0.5f;
+            float cy = (minY + maxY) * 0.5f;
+            float dcx = cx - w * 0.5f;
+            float dcy = cy - h * 0.5f;
+            float dist = std::sqrt(dcx * dcx + dcy * dcy);
+            float score = extent / (dist + 1.0f);
+            items.push_back(VisibleItem{(uint32_t)i, (uint32_t)lodI, score});
         }
         for (int i = n; i < committed; ++i) {
             if (gMetas[(size_t)i].count <= 0) continue;
             int lodI = std::min(gMetas[(size_t)i].count, 1024);
-            gVisiblePackedCPU.push_back((uint32_t)i);
-            gVisiblePackedCPU.push_back((uint32_t)lodI);
+            items.push_back(VisibleItem{(uint32_t)i, (uint32_t)lodI, 0.0f});
         }
         if (gLiveActive) {
             bool vis = true;
             int lodLive = std::min(gLiveMeta.count, 1024);
+            float score = 0.0f;
             if (gHasLiveBounds) {
                 const StrokeBoundsCPU& b = gLiveBounds;
                 float minX = b.minX * gViewScale + gViewTranslateX;
@@ -378,21 +397,39 @@ static void updateVisibleListIfNeeded() {
                 float dy = std::max(0.0f, maxY - minY);
                 float extent = std::sqrt(dx * dx + dy * dy);
                 lodLive = computeLodPointsFromScreenExtent(extent, gLiveMeta.count);
+                float cx = (minX + maxX) * 0.5f;
+                float cy = (minY + maxY) * 0.5f;
+                float dcx = cx - w * 0.5f;
+                float dcy = cy - h * 0.5f;
+                float dist = std::sqrt(dcx * dcx + dcy * dcy);
+                score = extent / (dist + 1.0f);
             }
             if (vis && lodLive > 0) {
-                gVisiblePackedCPU.push_back((uint32_t)committed);
-                gVisiblePackedCPU.push_back((uint32_t)lodLive);
+                items.push_back(VisibleItem{(uint32_t)committed, (uint32_t)lodLive, score});
             }
         }
     }
 
-    gVisibleCount = (int)(gVisiblePackedCPU.size() / 2u);
+    std::sort(items.begin(), items.end(), [](const VisibleItem& a, const VisibleItem& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.strokeId < b.strokeId;
+    });
+
+    gVisiblePackedCPU.clear();
+    gVisiblePackedCPU.reserve(items.size() * 2u);
+    for (const auto& it : items) {
+        gVisiblePackedCPU.push_back(it.strokeId);
+        gVisiblePackedCPU.push_back(it.lod);
+    }
+
+    gVisibleCount = (int)items.size();
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, gVisibleIndexSSBO);
     if (gVisibleCount > 0) {
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)((size_t)gVisibleCount * sizeof(uint32_t) * 2u), gVisiblePackedCPU.data());
     }
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, gVisibleIndexSSBO);
     gVisibleDirty.store(0);
+    resetProgress();
 }
 
 // 将一条笔划上传到GPU缓冲，并更新CPU侧元数据
@@ -566,11 +603,11 @@ void setOffscreen() {
     vCapSign = 0.0;
 }
 
-void setDegenerateAtScreen(vec2 anchorScreen) {
+void setDegenerateAtScreen(vec2 anchorScreen, float zNdc) {
     vec2 ndc;
     ndc.x = (anchorScreen.x / uResolution.x) * 2.0 - 1.0;
     ndc.y = 1.0 - (anchorScreen.y / uResolution.y) * 2.0;
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_Position = vec4(ndc, zNdc, 1.0);
     vColor = vec4(0.0);
     vEffect = 0.0;
     vMode = 0.0;
@@ -588,6 +625,9 @@ void main() {
     int base = visibleIndex * 2;
     int strokeId = int(visiblePacked[base + 0]);
     int lodPoints = int(visiblePacked[base + 1]);
+    float strokeDenom = max(uStrokeCount, 1.0);
+    float strokeNorm = (float(strokeId) + 0.5) / strokeDenom;
+    float zNdc = 1.0 - 2.0 * strokeNorm;
 
     int start = metas[strokeId].start;
     int count = metas[strokeId].count;
@@ -673,7 +713,7 @@ void main() {
     } else if (vid < kBodyEnd) {
         // 笔身：用采样点的法线偏移构造左右边界，转角处用miter限制避免尖刺过长
         if (count <= 1) {
-            setDegenerateAtScreen(p0Screen);
+            setDegenerateAtScreen(p0Screen, zNdc);
             return;
         }
         int bodyVid = vid - kBodyStart;
@@ -751,7 +791,7 @@ void main() {
     } else {
         // 结束端帽：以终点为中心，沿笔迹方向生成端部几何
         if (count <= 1) {
-            setDegenerateAtScreen(p0Screen);
+            setDegenerateAtScreen(p0Screen, zNdc);
             return;
         }
         int capVid = vid - kEndCapStart;
@@ -776,7 +816,7 @@ void main() {
     vec2 ndc;
     ndc.x = (posScreen.x / uResolution.x) * 2.0 - 1.0;
     ndc.y = 1.0 - (posScreen.y / uResolution.y) * 2.0;
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_Position = vec4(ndc, zNdc, 1.0);
     if (degenerateTail) {
         vColor = vec4(0.0);
         vEffect = 0.0;
@@ -826,7 +866,7 @@ void main() {
     float aaCap = max(fwidth(sdf) * 1.5, 1.0);
     float alphaCap = 1.0 - smoothstep(-0.5 * aaCap, 0.5 * aaCap, sdf);
 
-    float useCap = step(0.5, vMode);
+    float useCap = clamp(vMode, 0.0, 1.0);
     float alpha = mix(alphaBody, alphaCap, useCap);
     float outA = vColor.a * alpha;
     fragColor = vec4(vColor.rgb * outA, outA);
@@ -866,7 +906,7 @@ void main() {
     float aaCap = max(fwidth(sdf) * 1.5, 1.0);
     float alphaCap = 1.0 - smoothstep(-0.5 * aaCap, 0.5 * aaCap, sdf);
 
-    float useCap = step(0.5, vMode);
+    float useCap = clamp(vMode, 0.0, 1.0);
     float alpha = mix(alphaBody, alphaCap, useCap);
 
     // 源颜色：预乘alpha
@@ -926,7 +966,7 @@ void main() {
     float aaCap = max(fwidth(sdf) * 1.5, 1.0);
     float alphaCap = 1.0 - smoothstep(-0.5 * aaCap, 0.5 * aaCap, sdf);
 
-    float useCap = step(0.5, vMode);
+    float useCap = clamp(vMode, 0.0, 1.0);
     float alpha = mix(alphaBody, alphaCap, useCap);
 
     float Sa = vColor.a * alpha;
@@ -999,8 +1039,10 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
     LOGW("GL Renderer: %s", glGetString(GL_RENDERER));
     LOGW("GL Vendor: %s", glGetString(GL_VENDOR));
     LOGW("GL Version: %s", glGetString(GL_VERSION));
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
+    glClearDepthf(1.0f);
     glEnable(GL_BLEND);
     glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
 
@@ -1198,9 +1240,10 @@ JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobject /*thiz*/) {
     while (glGetError() != GL_NO_ERROR) {}
     glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
     glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
     
     if (!gProgram) return;
@@ -1300,6 +1343,18 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
             glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         }
         int drawCount = (gVisibleIndexSSBO ? gVisibleCount : (gLiveActive ? totalStrokes : committedStrokes));
+        if (gVisibleIndexSSBO) {
+            int progress = gProgressCount.load();
+            if (progress <= 0) progress = computeBaseProgressBudget();
+            drawCount = std::min(drawCount, progress);
+
+            if (gIsInteracting.load() == 0 && drawCount < gVisibleCount) {
+                int next = gProgressCount.load() + 2000;
+                if (next < 0) next = 0;
+                if (next > gVisibleCount) next = gVisibleCount;
+                gProgressCount.store(next);
+            }
+        }
         if (drawCount > 0) {
             if (uStrokeCountLoc >= 0) glUniform1f(uStrokeCountLoc, (float)std::max(totalStrokes, 1));
             if (uBaseInstanceLoc >= 0) glUniform1f(uBaseInstanceLoc, 0.0f);
@@ -1342,6 +1397,7 @@ Java_com_example_myapplication_NativeBridge_setViewScale(JNIEnv* env, jobject /*
     // 防止除零或过小值导致视觉异常
     gViewScale = (scale < 1e-4f) ? 1e-4f : scale;
     gVisibleDirty.store(1);
+    resetProgress();
 }
 
 JNIEXPORT void JNICALL
@@ -1350,6 +1406,15 @@ Java_com_example_myapplication_NativeBridge_setViewTransform(JNIEnv* env, jobjec
     gViewTranslateX = cx;
     gViewTranslateY = cy;
     gVisibleDirty.store(1);
+    resetProgress();
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_myapplication_NativeBridge_setInteractionState(JNIEnv* env, jobject /*thiz*/, jboolean isInteracting, jlong timestampMs) {
+    (void)env;
+    gIsInteracting.store(isInteracting ? 1 : 0);
+    gLastInteractionMs.store((int64_t)timestampMs);
+    resetProgress();
 }
 
 JNIEXPORT void JNICALL

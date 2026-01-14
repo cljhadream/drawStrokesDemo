@@ -77,6 +77,7 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
         }
         override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
             queueEvent {
+                NativeBridge.setInteractionState(true, System.currentTimeMillis())
                 // 缩放手势进行中启用低LOD：显著降低每条笔划参与渲染的点数，优先保证交互流畅
                 NativeBridge.setRenderMaxPoints(256)
             }
@@ -85,6 +86,7 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
 
         override fun onScaleEnd(detector: ScaleGestureDetector) {
             queueEvent {
+                NativeBridge.setInteractionState(false, System.currentTimeMillis())
                 // 手势结束恢复全量渲染，保证最终静止画面质量
                 NativeBridge.setRenderMaxPoints(1024)
             }

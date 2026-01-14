@@ -19,6 +19,7 @@ object NativeBridge {
      * - 取值范围：1..1024
      */
     external fun setRenderMaxPoints(maxPoints: Int)
+    external fun setInteractionState(isInteracting: Boolean, timestampMs: Long)
     external fun beginLiveStroke(color: FloatArray)
     external fun updateLiveStroke(points: FloatArray, pressures: FloatArray)
     external fun updateLiveStrokeWithCount(points: FloatArray, pressures: FloatArray, count: Int)
