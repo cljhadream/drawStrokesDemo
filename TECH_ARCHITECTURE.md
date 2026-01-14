@@ -39,9 +39,11 @@
 
 ### 3.3 Kotlin→JNI 桥
 
-- `NativeBridge` 暴露渲染与数据提交接口：`app/src/main/java/com/example/myapplication/NativeBridge.kt:11-36`
+- `NativeBridge` 暴露渲染与数据提交接口：`app/src/main/java/com/example/myapplication/NativeBridge.kt`
   - 生命周期：`onNativeSurfaceCreated/Changed/DrawFrame`
   - 视图变换：`setViewTransform(scale, cx, cy)`
+  - 交互状态：`setInteractionState(isInteracting, timestampMs)`（用于渐进式渲染预算）
+  - 渲染LOD：`setRenderMaxPoints(maxPoints)`（手势缩放期间降低单条笔迹参与点数）
   - 批量笔划：`addStrokeBatch(pointsFlat, pressuresFlat, counts, colors)`
   - 实时预览：`beginLiveStroke/updateLiveStroke/endLiveStroke`
 
@@ -89,8 +91,18 @@
   - `kVertsPerStroke = kMaxPointsPerStroke * 2 + 8`（起笔端帽 4 个顶点 + 主体 2*1024 个顶点 + 收笔端帽 4 个顶点）
   - 顶点着色器用 `count/start` 从 SSBO 读取中心线点与压力，并在屏幕空间计算偏移生成条带
 - 真正绘制调用（SSBO 路径）：
-  - `glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, kVertsPerStroke, drawCount)`
-  - 位置：`app/src/main/cpp/native-lib.cpp:988-1001`
+  - `glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, vertsPerStroke, drawCount)`
+  - `vertsPerStroke = renderMaxPoints * 2 + 8`（端帽 8 + 笔身 2*renderMaxPoints）
+  - `drawCount = min(visibleCount, progressCount)`（渐进式补全时），否则为可见笔迹数
+  - 位置：`app/src/main/cpp/native-lib.cpp`
+
+### 5.2.1 渐进式渲染（Progressive Refinement）
+
+- 目标：缩放/拖动时“立刻响应”，静止后“逐帧补全细节”，且每帧仍保持单次实例化绘制调用。
+- 可见列表：原生层在 `updateVisibleListIfNeeded()` 内构建 `visiblePacked`（SSBO binding=3），元素为 `(strokeId, lodPoints)` 对。
+- 优先级排序：对每条可见笔迹计算优先级分数并排序（中心更近、投影更大优先），确保用户关注区域优先出现。
+- 渐进式实例数：每帧仅绘制 `progressCount` 条（`drawCount=min(visibleCount, progressCount)`），剩余在后续帧补齐。
+- 交互取消：Kotlin 在缩放手势 begin/end 通过 `setInteractionState(...)` 透传交互状态；视图变化/交互状态变化会重置 `progressCount`，丢弃未完成补全进度并重新开始。
 
 ### 5.3 顶点着色器生成条带几何（主体 + 端帽）
 
@@ -100,11 +112,13 @@
   - 对 miter 长度做上限钳制（例如 `miterLen <= 4.0`）
 - 端帽：起笔/收笔各生成一个 4 顶点矩形，通过片元阶段的圆/半平面 SDF 裁切得到圆头端帽。
 - 宽度与缩放：当前半径按 `baseWidth * pressure * uViewScale` 参与屏幕空间偏移，缩放时笔触宽度会随缩放一起变化。
+- 深度并集：顶点着色器为每条笔迹分配稳定深度（按 strokeId 映射到 NDC z），配合深度测试避免同笔迹自交重复混合加深。
 
 ### 5.4 片元着色器抗锯齿与透明度
 
 - 主体：使用插值后的 `vEdgeSigned/vHalfWidth` 构造到边缘距离，并用 `fwidth` + `smoothstep` 做抗锯齿。
 - 端帽：使用 `vCapLocal/vCapRadius/vCapSign` 构造圆形 SDF，并与平面 SDF 做并/交得到“圆头/半圆”效果，再用 `fwidth` + `smoothstep` 抗锯齿。
+- 端帽拼接缝：端帽与笔身在同一三角带连接时，片元阶段用 `clamp(vMode,0..1)` 做连续混合，避免连接三角形出现“白线缝隙”伪影。
 - 输出：统一输出预乘 alpha（`fragColor = vec4(rgb * outA, outA)`）。
 
 ### 5.7 抗锯齿增强方案（MSAA + 着色器 AA 加宽）
@@ -138,8 +152,8 @@
 
 - 目标：同一条笔迹自相交时，不出现重复混合导致的局部加深；视觉上更接近“并集覆盖”。
 - 做法：
-  - 顶点着色器为每条笔迹分配稳定深度（按 strokeId 映射到 depth 0..1）。
-  - 渲染开启深度测试与深度写入（`GL_DEPTH_TEST` + `glDepthMask(GL_TRUE)`），并在每帧清除深度缓冲。
+  - 顶点着色器为每条笔迹分配稳定深度（按 strokeId 映射到 NDC z；同一笔迹的所有片元深度相同）。
+  - 渲染开启深度测试与深度写入：`glEnable(GL_DEPTH_TEST)`、`glDepthFunc(GL_LESS)`、`glDepthMask(GL_TRUE)`，并在每帧清除深度缓冲（`GL_DEPTH_BUFFER_BIT`）。
   - 由于同一条笔迹的所有片元深度相同，深度函数使用 `GL_LESS` 时，同一像素第一次写入后，后续等深片元会被拒绝，从而避免“自交处重复叠加”。
 - 依赖：需要 EGL 配置包含深度缓冲（当前 `GLSurfaceView` 请求 16-bit depth：`StrokeGLSurfaceView.kt:72-74`），并在原生层清除 `GL_DEPTH_BUFFER_BIT`。
 
@@ -148,6 +162,7 @@
 ### 6.1 渲染侧（GPU/Draw）
 
 - 单次实例化绘制：用一次 `glDrawArraysInstanced` 画出所有笔迹，避免每条笔迹多次 draw。
+- 渐进式补全：交互中降低 `progressCount` 保证帧率，静止后逐帧递增补全，仍保持单次 drawcall/帧。
 - SSBO 承载大数据：positions/pressures/meta 走 `std430`，减少 attribute 带宽压力：`native-lib.cpp:301-307`
 - 预分配大容量：启动时 `gAllocatedStrokes=4096`，减少频繁扩容与重分配：`native-lib.cpp:559-604`
 - 缓冲扩容采用“新建更大缓冲+拷贝旧数据”：`resizeBufferCopy()`：`native-lib.cpp:66-79`
@@ -163,7 +178,8 @@
 ### 6.3 鲁棒性（减少异常几何/伪影）
 
 - 拐点连接对 miter 做限制并钳制最大长度，避免回折时产生异常扇形几何：`app/src/main/cpp/native-lib.cpp:453-486`
-- 深度缓冲按笔迹做稳定排序，并用于避免同笔迹自交重复叠加：`app/src/main/cpp/native-lib.cpp:518-525`
+- 深度缓冲按笔迹做稳定排序，并用于避免同笔迹自交重复叠加：`app/src/main/cpp/native-lib.cpp`
+- 端帽与笔身连接处使用连续混合，避免端帽半圆处出现缝隙白线：`app/src/main/cpp/native-lib.cpp`
 
 ## 7. 实时书写（Live Stroke）机制
 
