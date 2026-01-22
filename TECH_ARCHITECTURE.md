@@ -1,5 +1,9 @@
 # 项目技术架构与渲染方案（OpenGL ES 矢量笔迹）
 
+## 相关文档
+
+- 笔迹渲染“缩放无棱角”技术选型方案：[TECH_SELECTION_STROKE_SMOOTH_ZOOM.md](TECH_SELECTION_STROKE_SMOOTH_ZOOM.md)
+
 ## 1. 目标与约束
 
 - 目标：在 Android 设备上实现流畅的手写矢量笔迹渲染，并支持画布缩放与平移。
@@ -81,8 +85,11 @@
 - SSBO 绑定：
   - `binding=0`：meta 数组
   - `binding=1`：positions（vec2）
-  - `binding=2`：pressures（float）
+  - `binding=2`：pressuresPacked（uint，每个 uint32 打包 2 个 UNORM16 压力）
   - GLSL 声明：`app/src/main/cpp/native-lib.cpp:304-318`
+- 显存优化要点：
+  - SSBO 渲染路径不再保留“与 SSBO 重复的 per-point 大 VBO”，仅保留很小的占位 VBO（用于顶点属性检查），避免一份点数据在 GPU 上存两份。
+  - 压力从 float32 改为 UNORM16（每 2 点打包 1 个 uint32），压力缓冲显存约减半。
 
 ### 5.2 实例化绘制（单次 Draw Call）
 
@@ -93,16 +100,15 @@
 - 真正绘制调用（SSBO 路径）：
   - `glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, vertsPerStroke, drawCount)`
   - `vertsPerStroke = renderMaxPoints * 2 + 8`（端帽 8 + 笔身 2*renderMaxPoints）
-  - `drawCount = min(visibleCount, progressCount)`（渐进式补全时），否则为可见笔迹数
+  - `drawCount = visibleCount`（当前默认关闭渐进式补全，以保证层级稳定）
   - 位置：`app/src/main/cpp/native-lib.cpp`
 
 ### 5.2.1 渐进式渲染（Progressive Refinement）
 
 - 目标：缩放/拖动时“立刻响应”，静止后“逐帧补全细节”，且每帧仍保持单次实例化绘制调用。
 - 可见列表：原生层在 `updateVisibleListIfNeeded()` 内构建 `visiblePacked`（SSBO binding=3），元素为 `(strokeId, lodPoints)` 对。
-- 优先级排序：对每条可见笔迹计算优先级分数并排序（中心更近、投影更大优先），确保用户关注区域优先出现。
-- 渐进式实例数：每帧仅绘制 `progressCount` 条（`drawCount=min(visibleCount, progressCount)`），剩余在后续帧补齐。
-- 交互取消：Kotlin 在缩放手势 begin/end 通过 `setInteractionState(...)` 透传交互状态；视图变化/交互状态变化会重置 `progressCount`，丢弃未完成补全进度并重新开始。
+- 说明：该机制在当前版本默认关闭。原因是“可见集合/排序”在缩放时会变化，叠加透明混合容易出现笔迹层级与颜色叠加结果随缩放跳变。
+- 重新启用建议：可继续按 score 选择“优先集”，但写入 `visiblePacked` 前对优先集按 `strokeId` 重新排序，保证层级稳定。
 
 ### 5.3 顶点着色器生成条带几何（主体 + 端帽）
 
@@ -112,7 +118,7 @@
   - 对 miter 长度做上限钳制（例如 `miterLen <= 4.0`）
 - 端帽：起笔/收笔各生成一个 4 顶点矩形，通过片元阶段的圆/半平面 SDF 裁切得到圆头端帽。
 - 宽度与缩放：当前半径按 `baseWidth * pressure * uViewScale` 参与屏幕空间偏移，缩放时笔触宽度会随缩放一起变化。
-- 深度并集：顶点着色器为每条笔迹分配稳定深度（按 strokeId 映射到 NDC z），配合深度测试避免同笔迹自交重复混合加深。
+- 深度并集（可选）：顶点着色器可为每条笔迹分配稳定深度（按 strokeId 映射到 NDC z），配合深度测试避免同笔迹自交重复混合加深；当前 SSBO 路径默认关闭深度测试，以保证透明层级稳定。
 
 ### 5.4 片元着色器抗锯齿与透明度
 
@@ -156,17 +162,21 @@
   - 渲染开启深度测试与深度写入：`glEnable(GL_DEPTH_TEST)`、`glDepthFunc(GL_LESS)`、`glDepthMask(GL_TRUE)`，并在每帧清除深度缓冲（`GL_DEPTH_BUFFER_BIT`）。
   - 由于同一条笔迹的所有片元深度相同，深度函数使用 `GL_LESS` 时，同一像素第一次写入后，后续等深片元会被拒绝，从而避免“自交处重复叠加”。
 - 依赖：需要 EGL 配置包含深度缓冲（当前 `GLSurfaceView` 请求 16-bit depth：`StrokeGLSurfaceView.kt:72-74`），并在原生层清除 `GL_DEPTH_BUFFER_BIT`。
+- 当前状态：为避免缩放时“可见列表/排序变化 + 深度 + 透明混合”带来的层级跳变，SSBO 路径当前默认关闭深度测试/写入；如果需要“自交并集”效果，建议在启用深度前先固定可见列表顺序。
 
 ## 6. 性能优化点（当前实现）
 
 ### 6.1 渲染侧（GPU/Draw）
 
 - 单次实例化绘制：用一次 `glDrawArraysInstanced` 画出所有笔迹，避免每条笔迹多次 draw。
-- 渐进式补全：交互中降低 `progressCount` 保证帧率，静止后逐帧递增补全，仍保持单次 drawcall/帧。
 - SSBO 承载大数据：positions/pressures/meta 走 `std430`，减少 attribute 带宽压力：`native-lib.cpp:301-307`
 - 预分配大容量：启动时 `gAllocatedStrokes=4096`，减少频繁扩容与重分配：`native-lib.cpp:559-604`
 - 缓冲扩容采用“新建更大缓冲+拷贝旧数据”：`resizeBufferCopy()`：`native-lib.cpp:66-79`
-- 顶点数据 half-float（如果驱动支持）：降低 VBO 带宽与体积：`native-lib.cpp:538-574`
+- 显存优化（已落地，效果显著）：
+  - 移除 SSBO 路径下重复的 per-point 大 VBO（点数据不再在 GPU 上存两份）。
+  - 压力 SSBO 改为 UNORM16 打包（每 2 点打包 1 个 uint32），压力缓冲显存约减半。
+  - 实测总显存占用下降约 50%（你的设备观测结果）。
+- 顶点数据 half-float：当前用于回退/兼容路径的 VBO（如果驱动支持），用于降低 VBO 带宽与体积：`native-lib.cpp:538-574`
 
 ### 6.2 数据提交侧（CPU/JNI）
 
