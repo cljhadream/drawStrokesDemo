@@ -4,7 +4,7 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-layout.buildDirectory.set(rootProject.layout.buildDirectory.dir("app"))
+layout.buildDirectory.set(rootProject.layout.projectDirectory.dir(".tmp-build/${project.name}"))
 
 android {
     namespace = "com.example.myapplication"

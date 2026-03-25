@@ -9,30 +9,27 @@
 
 ### Gradle
 .gradle/
-build/
+.gradle-user-home/
+.tmp-build/
 **/build/
-build*/
-**/build*/
-app/build5/
-app/release/
 
-### Android
+### Android build outputs
 *.apk
 *.ap_
 *.aab
 captures/
+app/release/
 
 ### Local configuration
 local.properties
 
 ### Native build (CMake/NDK)
-.cxx/
-.externalNativeBuild/
 **/.cxx/
 **/.externalNativeBuild/
 
-### Logs
+### Logs (ignore runtime logs, keep assets samples if needed)
 *.log
+!**/src/main/assets/*.log
 
 ### OS
 .DS_Store

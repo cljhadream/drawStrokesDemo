@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <unistd.h>
 
-#define LOG_TAG "NativeLib"
+#define LOG_TAG "NativeLib@20260123_2"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -77,6 +77,7 @@ static int gGlErrorLogBudget = 16;
 static std::atomic<int> gStrokeUploadLogBudget{8};
 static std::atomic<int> gBatchUploadLogBudget{8};
 static std::atomic<int> gQueueLogBudget{8};
+static std::atomic<int> gViewTransformLogBudget{64};
 static std::atomic<int> gFirstFrameLogOnce{1};
 static std::atomic<int> gFallbackFirstFrameLogOnce{1};
 static bool gUseFramebufferFetch = false;
@@ -128,6 +129,10 @@ struct StrokeMetaCPU {
     float baseWidth;
     float pad;
     float color[4];
+    float type;
+    float reserved0;
+    float reserved1;
+    float reserved2;
 };
 static std::vector<StrokeMetaCPU> gMetas;
 struct StrokeBoundsCPU {
@@ -150,6 +155,7 @@ struct PendingStroke {
     std::vector<float> points;   // 2*N
     std::vector<float> pressures;// N
     std::vector<float> color;    // 4
+    int type = 0;
 };
 static std::vector<PendingStroke> gPendingStrokes;
 
@@ -632,6 +638,7 @@ static bool writeFallbackMeta(int strokeId,
                               int count,
                               float baseWidth,
                               float effect,
+                              float type,
                               const float color[4],
                               float boundsMinX,
                               float boundsMinY,
@@ -655,7 +662,7 @@ static bool writeFallbackMeta(int strokeId,
     px[0] = floatToHalf((float)count);
     px[1] = floatToHalf(baseWidth);
     px[2] = floatToHalf(effect);
-    px[3] = floatToHalf(0.0f);
+    px[3] = floatToHalf(type);
     px[4] = floatToHalf(boundsMinX);
     px[5] = floatToHalf(boundsMinY);
     px[6] = floatToHalf(boundsSpanX);
@@ -980,7 +987,8 @@ static void updateVisibleListIfNeeded() {
 // 将一条笔划上传到GPU缓冲，并更新CPU侧元数据
 static void uploadStroke(const std::vector<float>& pts,
                          const std::vector<float>& prs,
-                         const std::vector<float>& col) {
+                         const std::vector<float>& col,
+                         int type) {
     if (pts.empty() || prs.empty() || col.size() < 4) return;
     int N = (int)prs.size();
     if ((int)pts.size() < N * 2) return;
@@ -1001,7 +1009,7 @@ static void uploadStroke(const std::vector<float>& pts,
             LOGE("Fallback: write points failed, strokeId=%d", strokeId);
             return;
         }
-        if (!writeFallbackMeta(strokeId, N, 16.0f, 0.0f, c, b.minX, b.minY, spanX, spanY)) {
+        if (!writeFallbackMeta(strokeId, N, 16.0f, 0.0f, (float)type, c, b.minX, b.minY, spanX, spanY)) {
             LOGE("Fallback: write meta failed, strokeId=%d", strokeId);
             return;
         }
@@ -1061,6 +1069,10 @@ static void uploadStroke(const std::vector<float>& pts,
     meta.baseWidth = 16.0f;
     meta.pad = 0.0f;
     meta.color[0] = col[0]; meta.color[1] = col[1]; meta.color[2] = col[2]; meta.color[3] = col[3];
+    meta.type = (float)type;
+    meta.reserved0 = 0.0f;
+    meta.reserved1 = 0.0f;
+    meta.reserved2 = 0.0f;
     gMetas.push_back(meta);
     StrokeBoundsCPU bounds = computeBoundsFromPoints(pts.data(), N);
     if ((int)gBounds.size() < strokeId) gBounds.resize((size_t)strokeId);
@@ -1074,8 +1086,8 @@ static void uploadStroke(const std::vector<float>& pts,
     float lastX = (N >= 1) ? posWrite[(N - 1) * 2] : 0.0f;
     float lastY = (N >= 1) ? posWrite[(N - 1) * 2 + 1] : 0.0f;
     if (gStrokeUploadLogBudget.fetch_sub(1) > 0) {
-        LOGI("addStroke(uploaded): id=%d, count=%d width=%.1f color=(%.2f,%.2f,%.2f,%.2f) first=(%.1f,%.1f) last=(%.1f,%.1f)",
-             strokeId, N, meta.baseWidth, col[0], col[1], col[2], col[3], firstX, firstY, lastX, lastY);
+        LOGI("addStroke(uploaded): id=%d, count=%d type=%.0f width=%.1f color=(%.2f,%.2f,%.2f,%.2f) first=(%.1f,%.1f) last=(%.1f,%.1f)",
+             strokeId, N, meta.type, meta.baseWidth, col[0], col[1], col[2], col[3], firstX, firstY, lastX, lastY);
     }
     gVisibleDirty.store(1);
 }
@@ -1096,8 +1108,8 @@ static const char* kVS = R"(#version 310 es
 //
 // 视图变换：
 // - 坐标：screen = positions * uViewScale + uViewTranslate
-// - 宽度：为保持“物理粗细”不随缩放变化，宽度不跟随uViewScale缩放：
-//         radius = baseWidth * pressure * 0.5
+// - 宽度：跟随视图缩放，实现缩放时笔迹粗细等比变化：
+//         radius = baseWidth * pressure * 0.5 * uViewScale
 //
 // LOD（缩放手势期间降采样）：
 // - uRenderMaxPoints 控制每条笔划参与绘制的最大采样点数。
@@ -1111,6 +1123,7 @@ struct StrokeMeta {
     float baseWidth;
     float pad;
     vec4 color;
+    vec4 extra;
 };
 
 layout(std430, binding=0) buffer StrokeMetaBuf {
@@ -1138,6 +1151,8 @@ out highp float vHalfWidth;
 out highp vec2 vCapLocal;
 out highp float vCapRadius;
 out highp float vCapSign;
+out highp float vType;
+out highp float vSeed;
 
 highp vec2 safeNormalize(highp vec2 v) {
     highp float l = length(v);
@@ -1161,6 +1176,8 @@ void setOffscreen() {
     vCapLocal = vec2(0.0);
     vCapRadius = 0.0;
     vCapSign = 0.0;
+    vType = 0.0;
+    vSeed = 0.0;
 }
 
 void setDegenerateAtScreen(vec2 anchorScreen, float zNdc) {
@@ -1176,6 +1193,8 @@ void setDegenerateAtScreen(vec2 anchorScreen, float zNdc) {
     vCapLocal = vec2(0.0);
     vCapRadius = 0.0;
     vCapSign = 0.0;
+    vType = 0.0;
+    vSeed = 0.0;
 }
 
 void main() {
@@ -1193,6 +1212,8 @@ void main() {
     int count = metas[strokeId].count;
     float effect = metas[strokeId].pad;
     vEffect = effect;
+    vType = metas[strokeId].extra.x;
+    vSeed = fract(sin(float(strokeId) * 12.9898 + 78.233) * 43758.5453);
     // 分两次渲染时，用 effect 作为笔划分组标记：
     // - uPass==0：绘制 effect<=0.5 的笔划
     // - uPass==1：绘制 effect>0.5 的笔划
@@ -1223,8 +1244,8 @@ void main() {
     vec2 dirEnd = safeNormalize(pNScreen - pN1Screen);
     vec2 nStart = vec2(-dirStart.y, dirStart.x);
     vec2 nEnd = vec2(-dirEnd.y, dirEnd.x);
-    float r0 = metas[strokeId].baseWidth * loadPressure(start) * 0.5;
-    float rN = metas[strokeId].baseWidth * loadPressure(start + lastPointIdx) * 0.5;
+    float r0 = metas[strokeId].baseWidth * loadPressure(start) * 0.5 * uViewScale;
+    float rN = metas[strokeId].baseWidth * loadPressure(start + lastPointIdx) * 0.5 * uViewScale;
 
     int vid = gl_VertexID;
     bool degenerateTail = false;
@@ -1287,7 +1308,7 @@ void main() {
         vec2 pCurScreen = positions[idx] * uViewScale + uViewTranslate;
         float pressure = loadPressure(idx);
         // 修复：笔身宽度也需要随视图缩放，否则会变成细线
-        float radius = metas[strokeId].baseWidth * pressure * 0.5;
+        float radius = metas[strokeId].baseWidth * pressure * 0.5 * uViewScale;
 
         int prevSampleIdx = max(pointIdx - 1, 0);
         int nextSampleIdx = min(pointIdx + 1, maxPoints - 1);
@@ -1386,6 +1407,8 @@ void main() {
         vCapLocal = vec2(0.0);
         vCapRadius = 0.0;
         vCapSign = 0.0;
+        vType = 0.0;
+        vSeed = 0.0;
     }
 }
 )";
@@ -1406,8 +1429,38 @@ in highp float vHalfWidth;
 in highp vec2 vCapLocal;
 in highp float vCapRadius;
 in highp float vCapSign;
+in highp float vType;
+in highp float vSeed;
 
 out vec4 fragColor;
+
+highp float hash21(highp vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+}
+
+highp float noise2(highp vec2 p) {
+    highp vec2 i = floor(p);
+    highp vec2 f = fract(p);
+    highp float a = hash21(i);
+    highp float b = hash21(i + vec2(1.0, 0.0));
+    highp float c = hash21(i + vec2(0.0, 1.0));
+    highp float d = hash21(i + vec2(1.0, 1.0));
+    highp vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+}
+
+highp float fbm(highp vec2 p) {
+    highp float sum = 0.0;
+    highp float amp = 0.5;
+    for (int i = 0; i < 4; ++i) {
+        sum += amp * noise2(p);
+        p = p * 2.03 + vec2(17.0, 29.0);
+        amp *= 0.5;
+    }
+    return sum;
+}
 
 void main() {
     if (vColor.a <= 0.0) discard;
@@ -1428,8 +1481,22 @@ void main() {
 
     float useCap = clamp(vMode, 0.0, 1.0);
     float alpha = mix(alphaBody, alphaCap, useCap);
+    vec3 rgb = vColor.rgb;
     float outA = vColor.a * alpha;
-    fragColor = vec4(vColor.rgb * outA, outA);
+    if (vType > 0.5) {
+        float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
+        rgb = mix(rgb, vec3(luma), 0.55);
+        float angle = vSeed * 6.2831853;
+        mat2 R = mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
+        vec2 p = R * (gl_FragCoord.xy + vec2(vSeed * 97.0, vSeed * 193.0));
+        float g = fbm(p * 0.085 + vec2(vSeed * 13.0, vSeed * 31.0));
+        float g2 = fbm(p.yx * 0.16 + vec2(vSeed * 53.0, vSeed * 71.0));
+        float coverage = clamp(0.82 + 0.18 * g, 0.78, 1.0);
+        float shade = 1.0 - 0.10 * (1.0 - g2);
+        rgb *= shade;
+        outA *= coverage;
+    }
+    fragColor = vec4(rgb * outA, outA);
 }
 )";
 
@@ -1448,8 +1515,38 @@ in highp float vHalfWidth;
 in highp vec2 vCapLocal;
 in highp float vCapRadius;
 in highp float vCapSign;
+in highp float vType;
+in highp float vSeed;
 
 layout(location = 0) inout vec4 fragColor;
+
+highp float hash21(highp vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+}
+
+highp float noise2(highp vec2 p) {
+    highp vec2 i = floor(p);
+    highp vec2 f = fract(p);
+    highp float a = hash21(i);
+    highp float b = hash21(i + vec2(1.0, 0.0));
+    highp float c = hash21(i + vec2(0.0, 1.0));
+    highp float d = hash21(i + vec2(1.0, 1.0));
+    highp vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+}
+
+highp float fbm(highp vec2 p) {
+    highp float sum = 0.0;
+    highp float amp = 0.5;
+    for (int i = 0; i < 4; ++i) {
+        sum += amp * noise2(p);
+        p = p * 2.03 + vec2(17.0, 29.0);
+        amp *= 0.5;
+    }
+    return sum;
+}
 
 void main() {
     if (vColor.a <= 0.0) discard;
@@ -1472,6 +1569,19 @@ void main() {
     // 源颜色：预乘alpha
     float Sa = vColor.a * alpha;
     vec3 S = vColor.rgb;
+    if (vType > 0.5) {
+        float luma = dot(S, vec3(0.299, 0.587, 0.114));
+        S = mix(S, vec3(luma), 0.55);
+        float angle = vSeed * 6.2831853;
+        mat2 R = mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
+        vec2 p = R * (gl_FragCoord.xy + vec2(vSeed * 97.0, vSeed * 193.0));
+        float g = fbm(p * 0.085 + vec2(vSeed * 13.0, vSeed * 31.0));
+        float g2 = fbm(p.yx * 0.16 + vec2(vSeed * 53.0, vSeed * 71.0));
+        float coverage = clamp(0.82 + 0.18 * g, 0.78, 1.0);
+        float shade = 1.0 - 0.10 * (1.0 - g2);
+        S *= shade;
+        Sa *= coverage;
+    }
     vec3 Sp = S * Sa;
 
     // 目标颜色：预乘alpha（由framebuffer fetch提供）
@@ -1508,8 +1618,38 @@ in highp float vHalfWidth;
 in highp vec2 vCapLocal;
 in highp float vCapRadius;
 in highp float vCapSign;
+in highp float vType;
+in highp float vSeed;
 
 out vec4 fragColor;
+
+highp float hash21(highp vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+}
+
+highp float noise2(highp vec2 p) {
+    highp vec2 i = floor(p);
+    highp vec2 f = fract(p);
+    highp float a = hash21(i);
+    highp float b = hash21(i + vec2(1.0, 0.0));
+    highp float c = hash21(i + vec2(0.0, 1.0));
+    highp float d = hash21(i + vec2(1.0, 1.0));
+    highp vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+}
+
+highp float fbm(highp vec2 p) {
+    highp float sum = 0.0;
+    highp float amp = 0.5;
+    for (int i = 0; i < 4; ++i) {
+        sum += amp * noise2(p);
+        p = p * 2.03 + vec2(17.0, 29.0);
+        amp *= 0.5;
+    }
+    return sum;
+}
 
 void main() {
     if (vColor.a <= 0.0) discard;
@@ -1531,6 +1671,19 @@ void main() {
 
     float Sa = vColor.a * alpha;
     vec3 S = vColor.rgb;
+    if (vType > 0.5) {
+        float luma = dot(S, vec3(0.299, 0.587, 0.114));
+        S = mix(S, vec3(luma), 0.55);
+        float angle = vSeed * 6.2831853;
+        mat2 R = mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
+        vec2 p = R * (gl_FragCoord.xy + vec2(vSeed * 97.0, vSeed * 193.0));
+        float g = fbm(p * 0.085 + vec2(vSeed * 13.0, vSeed * 31.0));
+        float g2 = fbm(p.yx * 0.16 + vec2(vSeed * 53.0, vSeed * 71.0));
+        float coverage = clamp(0.82 + 0.18 * g, 0.78, 1.0);
+        float shade = 1.0 - 0.10 * (1.0 - g2);
+        S *= shade;
+        Sa *= coverage;
+    }
     vec3 Sp = S * Sa;
 
     vec4 dst = gl_LastFragColorARM;
@@ -1643,6 +1796,8 @@ out highp float vHalfWidth;
 out highp vec2 vCapLocal;
 out highp float vCapRadius;
 out highp float vCapSign;
+out highp float vType;
+out highp float vSeed;
 
 highp vec2 safeNormalize(highp vec2 v) {
     highp float l = length(v);
@@ -1678,6 +1833,8 @@ void setOffscreen() {
     vCapLocal = vec2(0.0);
     vCapRadius = 0.0;
     vCapSign = 0.0;
+    vType = 0.0;
+    vSeed = 0.0;
 }
 
 void setDegenerateAtScreen(vec2 anchorScreen, float zNdc) {
@@ -1693,6 +1850,8 @@ void setDegenerateAtScreen(vec2 anchorScreen, float zNdc) {
     vCapLocal = vec2(0.0);
     vCapRadius = 0.0;
     vCapSign = 0.0;
+    vType = 0.0;
+    vSeed = 0.0;
 }
 
 void main() {
@@ -1705,6 +1864,8 @@ void main() {
     float baseWidth = mbwc.y;
     float effect = mbwc.z;
     vEffect = effect;
+    vType = mbwc.w;
+    vSeed = fract(sin(float(strokeId) * 12.9898 + 78.233) * 43758.5453);
 
     // 分组渲染逻辑与SSBO路径保持一致
     if ((uPass == 0 && effect > 0.5) || (uPass == 1 && effect <= 0.5) || count <= 0) {
@@ -1738,8 +1899,8 @@ void main() {
     vec2 dirEnd = safeNormalize(pNScreen - pN1Screen);
     vec2 nStart = vec2(-dirStart.y, dirStart.x);
     vec2 nEnd = vec2(-dirEnd.y, dirEnd.x);
-    float r0 = baseWidth * p0w.z * 0.5;
-    float rN = baseWidth * pNw.z * 0.5;
+    float r0 = baseWidth * p0w.z * 0.5 * uViewScale;
+    float rN = baseWidth * pNw.z * 0.5 * uViewScale;
 
     int vid = gl_VertexID;
     bool degenerateTail = false;
@@ -1796,7 +1957,7 @@ void main() {
         vec3 pCurW = readPoint(strokeId, clampedPoint, mbounds);
         vec2 pCurScreen = pCurW.xy * uViewScale + uViewTranslate;
         float pressure = pCurW.z;
-        float radius = baseWidth * pressure * 0.5;
+        float radius = baseWidth * pressure * 0.5 * uViewScale;
 
         int prevSampleIdx = max(pointIdx - 1, 0);
         int nextSampleIdx = min(pointIdx + 1, maxPoints - 1);
@@ -1891,6 +2052,8 @@ void main() {
         vCapLocal = vec2(0.0);
         vCapRadius = 0.0;
         vCapSign = 0.0;
+        vType = 0.0;
+        vSeed = 0.0;
     }
 }
 )";
@@ -1907,7 +2070,38 @@ in highp float vHalfWidth;
 in highp vec2 vCapLocal;
 in highp float vCapRadius;
 in highp float vCapSign;
+in highp float vType;
+in highp float vSeed;
 out vec4 fragColor;
+
+highp float hash21(highp vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+}
+
+highp float noise2(highp vec2 p) {
+    highp vec2 i = floor(p);
+    highp vec2 f = fract(p);
+    highp float a = hash21(i);
+    highp float b = hash21(i + vec2(1.0, 0.0));
+    highp float c = hash21(i + vec2(0.0, 1.0));
+    highp float d = hash21(i + vec2(1.0, 1.0));
+    highp vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+}
+
+highp float fbm(highp vec2 p) {
+    highp float sum = 0.0;
+    highp float amp = 0.5;
+    for (int i = 0; i < 4; ++i) {
+        sum += amp * noise2(p);
+        p = p * 2.03 + vec2(17.0, 29.0);
+        amp *= 0.5;
+    }
+    return sum;
+}
+
 void main() {
     if (vColor.a <= 0.0) discard;
     float aaBody = max(fwidth(vEdgeSigned) * 1.5, 1.0);
@@ -1925,8 +2119,22 @@ void main() {
 
     float useCap = clamp(vMode, 0.0, 1.0);
     float alpha = mix(alphaBody, alphaCap, useCap);
+    vec3 rgb = vColor.rgb;
     float outA = vColor.a * alpha;
-    fragColor = vec4(vColor.rgb * outA, outA);
+    if (vType > 0.5) {
+        float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
+        rgb = mix(rgb, vec3(luma), 0.55);
+        float angle = vSeed * 6.2831853;
+        mat2 R = mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
+        vec2 p = R * (gl_FragCoord.xy + vec2(vSeed * 97.0, vSeed * 193.0));
+        float g = fbm(p * 0.085 + vec2(vSeed * 13.0, vSeed * 31.0));
+        float g2 = fbm(p.yx * 0.16 + vec2(vSeed * 53.0, vSeed * 71.0));
+        float coverage = clamp(0.82 + 0.18 * g, 0.78, 1.0);
+        float shade = 1.0 - 0.10 * (1.0 - g2);
+        rgb *= shade;
+        outA *= coverage;
+    }
+    fragColor = vec4(rgb * outA, outA);
 }
 )";
 
@@ -2095,7 +2303,7 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
         if (!gPendingStrokes.empty()) {
             size_t pending = gPendingStrokes.size();
             for (const auto& ps : gPendingStrokes) {
-                uploadStroke(ps.points, ps.pressures, ps.color);
+                uploadStroke(ps.points, ps.pressures, ps.color, ps.type);
             }
             gPendingStrokes.clear();
             LOGI("Flushed pending strokes: %zu", pending);
@@ -2144,7 +2352,7 @@ Java_com_example_myapplication_NativeBridge_onNativeSurfaceCreated(JNIEnv* env, 
         gFallbackStrokeCount.store(0);
         if (!gPendingStrokes.empty()) {
             for (const auto& ps : gPendingStrokes) {
-                uploadStroke(ps.points, ps.pressures, ps.color);
+                uploadStroke(ps.points, ps.pressures, ps.color, ps.type);
             }
             gPendingStrokes.clear();
             LOGI("Flushed pending strokes: %zu", pending);
@@ -2285,7 +2493,7 @@ Java_com_example_myapplication_NativeBridge_onNativeDrawFrame(JNIEnv* env, jobje
     if (gFirstFrameLogOnce.fetch_sub(1) > 0) {
         LOGW("FirstFrame: useSSBO=%s framebufferFetch=%s scale=%.3f translate=(%.1f,%.1f) renderMaxPoints=%d committed=%d live=%s",
              gUseSSBO ? "yes" : "no",
-             gUseFramebufferFetch ? "yes" : "no",
+             gUseFramebufferFetch ? (gUseFramebufferFetchEXT ? "ext" : "arm") : "no",
              gViewScale,
              gViewTranslateX, gViewTranslateY,
              std::clamp(gRenderMaxPoints.load(), 1, 1024),
@@ -2398,6 +2606,9 @@ JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_setViewScale(JNIEnv* env, jobject /*thiz*/, jfloat scale) {
     // 防止除零或过小值导致视觉异常
     gViewScale = (scale < 1e-4f) ? 1e-4f : scale;
+    if (gViewTransformLogBudget.fetch_sub(1) > 0) {
+        LOGI("setViewScale: %.6f", gViewScale);
+    }
     gVisibleDirty.store(1);
     resetProgress();
 }
@@ -2407,6 +2618,9 @@ Java_com_example_myapplication_NativeBridge_setViewTransform(JNIEnv* env, jobjec
     gViewScale = (scale < 1e-4f) ? 1e-4f : scale;
     gViewTranslateX = cx;
     gViewTranslateY = cy;
+    if (gViewTransformLogBudget.fetch_sub(1) > 0) {
+        LOGI("setViewTransform: scale=%.6f translate=(%.2f,%.2f)", gViewScale, gViewTranslateX, gViewTranslateY);
+    }
     gVisibleDirty.store(1);
     resetProgress();
 }
@@ -2425,7 +2639,7 @@ Java_com_example_myapplication_NativeBridge_setRenderMaxPoints(JNIEnv* env, jobj
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_myapplication_NativeBridge_beginLiveStroke(JNIEnv* env, jobject /*thiz*/, jfloatArray color) {
+Java_com_example_myapplication_NativeBridge_beginLiveStroke(JNIEnv* env, jobject /*thiz*/, jfloatArray color, jint type) {
     if (env && color && env->GetArrayLength(color) >= 4) {
         env->GetFloatArrayRegion(color, 0, 4, gLiveColor);
     }
@@ -2439,6 +2653,10 @@ Java_com_example_myapplication_NativeBridge_beginLiveStroke(JNIEnv* env, jobject
     gLiveMeta.color[1] = gLiveColor[1];
     gLiveMeta.color[2] = gLiveColor[2];
     gLiveMeta.color[3] = gLiveColor[3];
+    gLiveMeta.type = (float)type;
+    gLiveMeta.reserved0 = 0.0f;
+    gLiveMeta.reserved1 = 0.0f;
+    gLiveMeta.reserved2 = 0.0f;
     gHasLiveBounds = false;
     gVisibleDirty.store(1);
 
@@ -2446,7 +2664,7 @@ Java_com_example_myapplication_NativeBridge_beginLiveStroke(JNIEnv* env, jobject
         int liveId = gFallbackStrokeCount.load();
         if (liveId < 0) liveId = 0;
         if (!ensureFallbackStorageCapacity(liveId + 1)) return;
-        writeFallbackMeta(liveId, 0, 16.0f, 0.0f, gLiveColor, 0.0f, 0.0f, 0.0f, 0.0f);
+        writeFallbackMeta(liveId, 0, 16.0f, 0.0f, (float)type, gLiveColor, 0.0f, 0.0f, 0.0f, 0.0f);
     }
 }
 
@@ -2478,7 +2696,7 @@ Java_com_example_myapplication_NativeBridge_updateLiveStroke(JNIEnv* env, jobjec
         float spanX = b.maxX - b.minX;
         float spanY = b.maxY - b.minY;
         writeFallbackPoints(liveId, pts.data(), prs.data(), N, b.minX, b.minY, spanX, spanY);
-        writeFallbackMeta(liveId, N, 16.0f, 0.0f, gLiveColor, b.minX, b.minY, spanX, spanY);
+        writeFallbackMeta(liveId, N, 16.0f, 0.0f, gLiveMeta.type, gLiveColor, b.minX, b.minY, spanX, spanY);
         return;
     }
 
@@ -2523,6 +2741,10 @@ Java_com_example_myapplication_NativeBridge_updateLiveStroke(JNIEnv* env, jobjec
     meta.color[1] = gLiveColor[1];
     meta.color[2] = gLiveColor[2];
     meta.color[3] = gLiveColor[3];
+    meta.type = gLiveMeta.type;
+    meta.reserved0 = 0.0f;
+    meta.reserved1 = 0.0f;
+    meta.reserved2 = 0.0f;
     gLiveMeta = meta;
     if (gUseSSBO && gStrokeMetaSSBO) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, gStrokeMetaSSBO);
@@ -2561,7 +2783,7 @@ Java_com_example_myapplication_NativeBridge_updateLiveStrokeWithCount(JNIEnv* en
         float spanX = b.maxX - b.minX;
         float spanY = b.maxY - b.minY;
         writeFallbackPoints(liveId, pts.data(), prs.data(), N, b.minX, b.minY, spanX, spanY);
-        writeFallbackMeta(liveId, N, 16.0f, 0.0f, gLiveColor, b.minX, b.minY, spanX, spanY);
+        writeFallbackMeta(liveId, N, 16.0f, 0.0f, gLiveMeta.type, gLiveColor, b.minX, b.minY, spanX, spanY);
         return;
     }
 
@@ -2606,6 +2828,10 @@ Java_com_example_myapplication_NativeBridge_updateLiveStrokeWithCount(JNIEnv* en
     meta.color[1] = gLiveColor[1];
     meta.color[2] = gLiveColor[2];
     meta.color[3] = gLiveColor[3];
+    meta.type = gLiveMeta.type;
+    meta.reserved0 = 0.0f;
+    meta.reserved1 = 0.0f;
+    meta.reserved2 = 0.0f;
     gLiveMeta = meta;
     if (gUseSSBO && gStrokeMetaSSBO) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, gStrokeMetaSSBO);
@@ -2660,7 +2886,8 @@ JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_addStroke(JNIEnv* env, jobject /*thiz*/,
                                                       jfloatArray points,
                                                       jfloatArray pressures,
-                                                      jfloatArray color) {
+                                                      jfloatArray color,
+                                                      jint type) {
     jsize pLen = env->GetArrayLength(points);    // 2*N
     jsize prLen = env->GetArrayLength(pressures);// N
     jsize cLen = env->GetArrayLength(color);     // 4
@@ -2682,6 +2909,7 @@ Java_com_example_myapplication_NativeBridge_addStroke(JNIEnv* env, jobject /*thi
         ps.points = std::move(pts);
         ps.pressures = std::move(prs);
         ps.color = std::move(col);
+        ps.type = (int)type;
         gPendingStrokes.push_back(std::move(ps));
         if (gQueueLogBudget.fetch_sub(1) > 0) {
             LOGW("addStroke queued (GL not ready): count=%d", N);
@@ -2689,7 +2917,7 @@ Java_com_example_myapplication_NativeBridge_addStroke(JNIEnv* env, jobject /*thi
         return;
     }
 
-    uploadStroke(pts, prs, col);
+    uploadStroke(pts, prs, col, (int)type);
     gVisibleDirty.store(1);
 }
 
@@ -2721,12 +2949,14 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
                                                            jfloatArray points,
                                                            jfloatArray pressures,
                                                            jintArray counts,
-                                                           jfloatArray colors) {
+                                                           jfloatArray colors,
+                                                           jintArray types) {
     jsize pLen = env->GetArrayLength(points);
     jsize prLen = env->GetArrayLength(pressures);
     jsize cLen = env->GetArrayLength(colors);
     jsize cntLen = env->GetArrayLength(counts);
-    if (cntLen <= 0 || pLen <= 0 || prLen <= 0 || cLen < cntLen * 4) return;
+    jsize tLen = types ? env->GetArrayLength(types) : 0;
+    if (cntLen <= 0 || pLen <= 0 || prLen <= 0 || cLen < cntLen * 4 || tLen < cntLen) return;
 
     bool ready = gGlReady && (gUseSSBO ? (gProgram != 0) : (gTexProgram != 0));
     if (!ready) {
@@ -2734,10 +2964,12 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
         std::vector<float> prsFlat(prLen);
         std::vector<int> cnts(cntLen);
         std::vector<float> colsFlat(cLen);
+        std::vector<int> typesFlat((size_t)cntLen);
         env->GetFloatArrayRegion(points, 0, pLen, ptsFlat.data());
         env->GetFloatArrayRegion(pressures, 0, prLen, prsFlat.data());
         env->GetIntArrayRegion(counts, 0, cntLen, cnts.data());
         env->GetFloatArrayRegion(colors, 0, cLen, colsFlat.data());
+        env->GetIntArrayRegion(types, 0, cntLen, typesFlat.data());
 
         int pi = 0, pri = 0;
         for (int s = 0; s < cntLen; ++s) {
@@ -2757,10 +2989,17 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
             ps.points = std::move(pts);
             ps.pressures = std::move(prs);
             ps.color = { colsFlat[(size_t)s * 4u + 0u], colsFlat[(size_t)s * 4u + 1u], colsFlat[(size_t)s * 4u + 2u], colsFlat[(size_t)s * 4u + 3u] };
+            ps.type = typesFlat[(size_t)s];
             gPendingStrokes.push_back(std::move(ps));
         }
         if (gQueueLogBudget.fetch_sub(1) > 0) {
-            LOGW("addStrokeBatch queued (GL not ready): strokes=%d", (int)cntLen);
+            int t0 = cntLen > 0 ? typesFlat[0] : -1;
+            float c0r = cLen >= 4 ? colsFlat[0] : -1.0f;
+            float c0g = cLen >= 4 ? colsFlat[1] : -1.0f;
+            float c0b = cLen >= 4 ? colsFlat[2] : -1.0f;
+            float c0a = cLen >= 4 ? colsFlat[3] : -1.0f;
+            LOGW("addStrokeBatch queued (GL not ready): strokes=%d t0=%d c0=(%.2f,%.2f,%.2f,%.2f)",
+                 (int)cntLen, t0, c0r, c0g, c0b, c0a);
         }
         return;
     }
@@ -2770,15 +3009,18 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
         jboolean copyPrs = JNI_FALSE;
         jboolean copyCols = JNI_FALSE;
         jboolean copyCnts = JNI_FALSE;
+        jboolean copyTypes = JNI_FALSE;
         const float* ptsPtr = env->GetFloatArrayElements(points, &copyPts);
         const float* prsPtr = env->GetFloatArrayElements(pressures, &copyPrs);
         const float* colsPtr = env->GetFloatArrayElements(colors, &copyCols);
         const jint* cntPtr = env->GetIntArrayElements(counts, &copyCnts);
-        if (!ptsPtr || !prsPtr || !colsPtr || !cntPtr) {
+        const jint* typePtr = env->GetIntArrayElements(types, &copyTypes);
+        if (!ptsPtr || !prsPtr || !colsPtr || !cntPtr || !typePtr) {
             if (ptsPtr) env->ReleaseFloatArrayElements(points, const_cast<jfloat*>(ptsPtr), JNI_ABORT);
             if (prsPtr) env->ReleaseFloatArrayElements(pressures, const_cast<jfloat*>(prsPtr), JNI_ABORT);
             if (colsPtr) env->ReleaseFloatArrayElements(colors, const_cast<jfloat*>(colsPtr), JNI_ABORT);
             if (cntPtr) env->ReleaseIntArrayElements(counts, const_cast<jint*>(cntPtr), JNI_ABORT);
+            if (typePtr) env->ReleaseIntArrayElements(types, const_cast<jint*>(typePtr), JNI_ABORT);
             return;
         }
 
@@ -2789,6 +3031,7 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
             env->ReleaseFloatArrayElements(pressures, const_cast<jfloat*>(prsPtr), JNI_ABORT);
             env->ReleaseFloatArrayElements(colors, const_cast<jfloat*>(colsPtr), JNI_ABORT);
             env->ReleaseIntArrayElements(counts, const_cast<jint*>(cntPtr), JNI_ABORT);
+            env->ReleaseIntArrayElements(types, const_cast<jint*>(typePtr), JNI_ABORT);
             LOGE("Fallback: ensure storage failed for batch, needed=%d", needed);
             return;
         }
@@ -2807,15 +3050,16 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
                 colsPtr[s * 4 + 2],
                 colsPtr[s * 4 + 3]
             };
+            float t = (float)typePtr[s];
             if (n > 0) {
                 const float* pxy = ptsPtr + (size_t)pi;
                 StrokeBoundsCPU b = computeBoundsFromPoints(pxy, n);
                 float spanX = b.maxX - b.minX;
                 float spanY = b.maxY - b.minY;
                 writeFallbackPoints(strokeId, pxy, prsPtr + (size_t)pri, n, b.minX, b.minY, spanX, spanY);
-                writeFallbackMeta(strokeId, n, 16.0f, 0.0f, c, b.minX, b.minY, spanX, spanY);
+                writeFallbackMeta(strokeId, n, 16.0f, 0.0f, t, c, b.minX, b.minY, spanX, spanY);
             } else {
-                writeFallbackMeta(strokeId, n, 16.0f, 0.0f, c, 0.0f, 0.0f, 0.0f, 0.0f);
+                writeFallbackMeta(strokeId, n, 16.0f, 0.0f, t, c, 0.0f, 0.0f, 0.0f, 0.0f);
             }
             pi += nSafe * 2;
             pri += nSafe;
@@ -2826,6 +3070,7 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
         env->ReleaseFloatArrayElements(pressures, const_cast<jfloat*>(prsPtr), JNI_ABORT);
         env->ReleaseFloatArrayElements(colors, const_cast<jfloat*>(colsPtr), JNI_ABORT);
         env->ReleaseIntArrayElements(counts, const_cast<jint*>(cntPtr), JNI_ABORT);
+        env->ReleaseIntArrayElements(types, const_cast<jint*>(typePtr), JNI_ABORT);
         return;
     }
 
@@ -2833,10 +3078,12 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
     std::vector<float> prsFlat(prLen);
     std::vector<int> cnts(cntLen);
     std::vector<float> colsFlat(cLen);
+    std::vector<int> typesFlat((size_t)cntLen);
     env->GetFloatArrayRegion(points, 0, pLen, ptsFlat.data());
     env->GetFloatArrayRegion(pressures, 0, prLen, prsFlat.data());
     env->GetIntArrayRegion(counts, 0, cntLen, cnts.data());
     env->GetFloatArrayRegion(colors, 0, cLen, colsFlat.data());
+    env->GetIntArrayRegion(types, 0, cntLen, typesFlat.data());
 
     if (!gGlReady || !gProgram) {
         int pi = 0, pri = 0;
@@ -2856,6 +3103,7 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
             ps.points = std::move(pts);
             ps.pressures = std::move(prs);
             ps.color = { colsFlat[s * 4 + 0], colsFlat[s * 4 + 1], colsFlat[s * 4 + 2], colsFlat[s * 4 + 3] };
+            ps.type = typesFlat[(size_t)s];
             gPendingStrokes.push_back(std::move(ps));
         }
         if (gQueueLogBudget.fetch_sub(1) > 0) {
@@ -2929,6 +3177,10 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
         m.color[1] = colsFlat[s * 4 + 1];
         m.color[2] = colsFlat[s * 4 + 2];
         m.color[3] = colsFlat[s * 4 + 3];
+        m.type = (float)typesFlat[(size_t)s];
+        m.reserved0 = 0.0f;
+        m.reserved1 = 0.0f;
+        m.reserved2 = 0.0f;
         metasBatch.push_back(m);
         gMetas.push_back(m);
 

@@ -13,8 +13,8 @@ import android.view.MotionEvent
 class StrokeInputProcessor(
     private val screenToWorld: (x: Float, y: Float) -> FloatArray,
     private val scaleProvider: () -> Float,
-    private val jniSubmit: (points: FloatArray, pressures: FloatArray, color: FloatArray) -> Unit,
-    private val liveBegin: (color: FloatArray) -> Unit,
+    private val jniSubmit: (points: FloatArray, pressures: FloatArray, color: FloatArray, type: Int) -> Unit,
+    private val liveBegin: (color: FloatArray, type: Int) -> Unit,
     private val liveUpdate: (points: FloatArray, pressures: FloatArray, count: Int) -> Unit,
     private val liveEnd: () -> Unit,
 ) {
@@ -36,6 +36,7 @@ class StrokeInputProcessor(
 
     // 当前笔划颜色（RGBA），可在外部动态修改
     var currentColor: FloatArray = floatArrayOf(0.1f, 0.4f, 1.0f, 0.85f)
+    var currentType: Int = 0
 
     fun cancelStroke() {
         rawPoints.clear()
@@ -62,7 +63,7 @@ class StrokeInputProcessor(
                 committedDuringGesture = false
                 rawPoints.add(PointF(x, y))
                 rawPressures.add(p)
-                liveBegin(currentColor)
+                liveBegin(currentColor, currentType)
                 beginLiveBuffers(x, y, p)
                 liveUpdate(livePointsBuf, livePressuresBuf, liveCount)
                 return true
@@ -81,7 +82,7 @@ class StrokeInputProcessor(
                     val segments = buildStrokeSegmentsBezierFixedStep(targetPoints = 1000)
                     if (segments.isNotEmpty()) {
                         for (seg in segments) {
-                            jniSubmit(seg.first, seg.second, currentColor)
+                            jniSubmit(seg.first, seg.second, currentColor, currentType)
                         }
                     } else {
                         submitLiveSegmentIfNeeded(force = true)
@@ -203,7 +204,7 @@ class StrokeInputProcessor(
         val prs = FloatArray(liveCount)
         System.arraycopy(livePointsBuf, 0, pts, 0, liveCount * 2)
         System.arraycopy(livePressuresBuf, 0, prs, 0, liveCount)
-        jniSubmit(pts, prs, currentColor)
+        jniSubmit(pts, prs, currentColor, currentType)
         committedDuringGesture = true
 
         val keepX = livePointsBuf[(liveCount - 1) * 2]

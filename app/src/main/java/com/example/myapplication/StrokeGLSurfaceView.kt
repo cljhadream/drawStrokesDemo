@@ -38,11 +38,11 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
             floatArrayOf((x - translateX) * inv, (y - translateY) * inv)
         },
         scaleProvider = { currentScale },
-        jniSubmit = { points, pressures, color ->
-            queueEvent { batcher.enqueue(points, pressures, color) }
+        jniSubmit = { points, pressures, color, type ->
+            queueEvent { batcher.enqueue(points, pressures, color, type) }
         },
-        liveBegin = { color ->
-            queueEvent { NativeBridge.beginLiveStroke(color) }
+        liveBegin = { color, type ->
+            queueEvent { NativeBridge.beginLiveStroke(color, type) }
         },
         liveUpdate = { points, pressures, count ->
             queueEvent { NativeBridge.updateLiveStrokeWithCount(points, pressures, count) }
@@ -115,6 +115,10 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
         
         // 强制设置视图可见性
         visibility = android.view.View.VISIBLE
+    }
+
+    fun setStrokeType(type: Int) {
+        input.currentType = if (type == 1) 1 else 0
     }
 
     fun setOnViewScaleChangedListener(listener: ((Float) -> Unit)?) {

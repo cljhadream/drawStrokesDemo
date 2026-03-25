@@ -25,13 +25,13 @@ object NativeBridge {
      */
     external fun setRenderMaxPoints(maxPoints: Int)
     external fun setInteractionState(isInteracting: Boolean, timestampMs: Long)
-    external fun beginLiveStroke(color: FloatArray)
+    external fun beginLiveStroke(color: FloatArray, type: Int)
     external fun updateLiveStroke(points: FloatArray, pressures: FloatArray)
     external fun updateLiveStrokeWithCount(points: FloatArray, pressures: FloatArray, count: Int)
     external fun endLiveStroke()
 
     // 传递笔划数据到原生层
-    external fun addStroke(points: FloatArray, pressures: FloatArray, color: FloatArray)
+    external fun addStroke(points: FloatArray, pressures: FloatArray, color: FloatArray, type: Int)
 
     // 获取当前笔划总数
     external fun getStrokeCount(): Int
@@ -45,8 +45,9 @@ object NativeBridge {
      * - pressures：按笔划拼接的压力数组，长度为 sum(counts)
      * - counts：每条笔划的点数
      * - colors：每条笔划的RGBA颜色，长度为 counts.size * 4
+     * - types：每条笔划的类型（0=pen, 1=pencil），长度为 counts.size
      */
-    external fun addStrokeBatch(points: FloatArray, pressures: FloatArray, counts: IntArray, colors: FloatArray)
+    external fun addStrokeBatch(points: FloatArray, pressures: FloatArray, counts: IntArray, colors: FloatArray, types: IntArray)
 
     external fun isUsingSSBO(): Boolean
 

@@ -1,5 +1,6 @@
 package com.example.myapplication
 
+import android.content.Intent
 import android.os.Bundle
 import android.util.TypedValue
 import android.util.Log
@@ -61,6 +62,28 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(scaleLabel, labelParams)
 
+        val replayButton = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            setBackgroundColor(0x80000000.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            val pad = dpToPx(8f)
+            setPadding(pad, pad, pad, pad)
+            text = "贝塞尔回放"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, BezierReplayActivity::class.java))
+            }
+        }
+        val replayParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.END or Gravity.TOP
+            val m = dpToPx(12f)
+            rightMargin = m
+            topMargin = m
+        }
+        root.addView(replayButton, replayParams)
+
         glView.setOnViewScaleChangedListener { scale ->
             scaleLabel.text = "${(scale * 100f).roundToInt()}%"
         }
@@ -93,7 +116,7 @@ class MainActivity : ComponentActivity() {
         val h = dm.heightPixels.toFloat()
         
         // 生成10万条线条，用于测试性能
-        val totalStrokeCount = 1000 //100000
+        val totalStrokeCount = 10 //100000
         val pointsPerStroke = 1024
         val batchSize = 1000 // 每批处理条数，避免内存峰值过高
         val totalBatches = (totalStrokeCount + batchSize - 1) / batchSize
@@ -113,12 +136,15 @@ class MainActivity : ComponentActivity() {
             val batchPressures = FloatArray(currentBatchSize * pointsPerStroke)
             val batchCounts = IntArray(currentBatchSize) { pointsPerStroke }
             val batchColors = FloatArray(currentBatchSize * 4)
+            val batchTypes = IntArray(currentBatchSize)
             
             var pointIndex = 0
             var pressureIndex = 0
             
             for (strokeIndex in startStroke until endStroke) {
                 val localStrokeIndex = strokeIndex - startStroke
+                val pseudo = (strokeIndex * 1103515245 + 12345) and Int.MAX_VALUE
+                batchTypes[localStrokeIndex] = if (pseudo % 5 == 0) 1 else 0
                 
                 // 为每条线生成随机颜色
                 val hue = (strokeIndex.toFloat() / totalStrokeCount) * 360f // 彩虹色谱
@@ -127,10 +153,17 @@ class MainActivity : ComponentActivity() {
                 val alpha = 0.6f + (strokeIndex % 5) * 0.08f // 0.6-0.92
                 
                 val rgb = hsvToRgb(hue, saturation, brightness)
-                batchColors[localStrokeIndex * 4] = rgb[0]
-                batchColors[localStrokeIndex * 4 + 1] = rgb[1] 
-                batchColors[localStrokeIndex * 4 + 2] = rgb[2]
-                batchColors[localStrokeIndex * 4 + 3] = alpha
+                if (batchTypes[localStrokeIndex] == 1) {
+                    batchColors[localStrokeIndex * 4] = 0.05f
+                    batchColors[localStrokeIndex * 4 + 1] = 0.05f
+                    batchColors[localStrokeIndex * 4 + 2] = 0.05f
+                    batchColors[localStrokeIndex * 4 + 3] = 1.0f
+                } else {
+                    batchColors[localStrokeIndex * 4] = rgb[0]
+                    batchColors[localStrokeIndex * 4 + 1] = rgb[1] 
+                    batchColors[localStrokeIndex * 4 + 2] = rgb[2]
+                    batchColors[localStrokeIndex * 4 + 3] = alpha
+                }
             
                 // 为每条线生成不同的位置和形状
                 // 使用随机分布确保覆盖整个屏幕
@@ -239,7 +272,8 @@ class MainActivity : ComponentActivity() {
                     batchPoints,
                     batchPressures, 
                     batchCounts,
-                    batchColors
+                    batchColors,
+                    batchTypes
                 )
                 val endTime = System.currentTimeMillis()
                 

@@ -10,11 +10,13 @@ class StrokeBatcher(
     private val pointsList = ArrayList<FloatArray>()
     private val pressuresList = ArrayList<FloatArray>()
     private val colorsList = ArrayList<FloatArray>()
+    private val typesList = ArrayList<Int>()
 
-    fun enqueue(points: FloatArray, pressures: FloatArray, color: FloatArray) {
+    fun enqueue(points: FloatArray, pressures: FloatArray, color: FloatArray, type: Int) {
         pointsList.add(points)
         pressuresList.add(pressures)
         colorsList.add(color)
+        typesList.add(type)
         if (pointsList.size >= maxBatchCount) {
             flush()
         } else {
@@ -37,6 +39,7 @@ class StrokeBatcher(
         val pressuresFlat = FloatArray(totalPoints)
         val counts = IntArray(pointsList.size)
         val colorsFlat = FloatArray(colorsList.size * 4)
+        val types = IntArray(typesList.size)
 
         var pi = 0
         var pri = 0
@@ -57,12 +60,16 @@ class StrokeBatcher(
             colorsFlat[i * 4 + 2] = c[2]
             colorsFlat[i * 4 + 3] = c[3]
         }
+        for (i in typesList.indices) {
+            types[i] = typesList[i]
+        }
 
         // 通过批量接口提交
-        NativeBridge.addStrokeBatch(pointsFlat, pressuresFlat, counts, colorsFlat)
+        NativeBridge.addStrokeBatch(pointsFlat, pressuresFlat, counts, colorsFlat, types)
 
         pointsList.clear()
         pressuresList.clear()
         colorsList.clear()
+        typesList.clear()
     }
 }
