@@ -1,5 +1,7 @@
 package com.example.myapplication
 
+import android.graphics.Bitmap
+
 /**
  * Kotlin到C++的JNI桥，提供渲染相关的本地方法接口。
  */
@@ -7,6 +9,9 @@ object NativeBridge {
     init {
         System.loadLibrary("native-lib")
     }
+
+    private var scratchPixels: IntArray? = null
+    private var scratchRgba: ByteArray? = null
 
     external fun onNativeSurfaceCreated()
     external fun onNativeSurfaceChanged(width: Int, height: Int)
@@ -42,4 +47,31 @@ object NativeBridge {
      * - colors：每条笔划的RGBA颜色，长度为 counts.size * 4
      */
     external fun addStrokeBatch(points: FloatArray, pressures: FloatArray, counts: IntArray, colors: FloatArray)
+
+    external fun isUsingSSBO(): Boolean
+
+    external fun updateFallbackImage(rgba: ByteArray, width: Int, height: Int)
+
+    fun updateFallbackBitmap(bitmap: Bitmap) {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w <= 0 || h <= 0) return
+
+        val pixelCount = w * h
+        val pixels = scratchPixels?.takeIf { it.size >= pixelCount } ?: IntArray(pixelCount).also { scratchPixels = it }
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        val rgbaSize = pixelCount * 4
+        val rgba = scratchRgba?.takeIf { it.size >= rgbaSize } ?: ByteArray(rgbaSize).also { scratchRgba = it }
+        var o = 0
+        for (i in 0 until pixelCount) {
+            val argb = pixels[i]
+            rgba[o + 0] = ((argb shr 16) and 0xFF).toByte()
+            rgba[o + 1] = ((argb shr 8) and 0xFF).toByte()
+            rgba[o + 2] = (argb and 0xFF).toByte()
+            rgba[o + 3] = ((argb ushr 24) and 0xFF).toByte()
+            o += 4
+        }
+        updateFallbackImage(rgba, w, h)
+    }
 }

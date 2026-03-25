@@ -12,7 +12,15 @@ import javax.microedition.khronos.egl.EGLDisplay
  * 配置OpenGL ES上下文版本为3，设置Renderer并启用连续渲染。
  */
 class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
-    private val renderer = NativeRenderer()
+    private var useSSBO = true
+    private val renderer = NativeRenderer(
+        onRendererModeResolved = { ssbo ->
+            useSSBO = ssbo
+        },
+        onSurfaceSizeChanged = { w, h ->
+            (w + h).hashCode()
+        }
+    )
     private val batcher = StrokeBatcher()
 
     // 视图变换参数：
@@ -31,24 +39,16 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
         },
         scaleProvider = { currentScale },
         jniSubmit = { points, pressures, color ->
-            queueEvent {
-                batcher.enqueue(points, pressures, color)
-            }
+            queueEvent { batcher.enqueue(points, pressures, color) }
         },
         liveBegin = { color ->
-            queueEvent {
-                NativeBridge.beginLiveStroke(color)
-            }
+            queueEvent { NativeBridge.beginLiveStroke(color) }
         },
         liveUpdate = { points, pressures, count ->
-            queueEvent {
-                NativeBridge.updateLiveStrokeWithCount(points, pressures, count)
-            }
+            queueEvent { NativeBridge.updateLiveStrokeWithCount(points, pressures, count) }
         },
         liveEnd = {
-            queueEvent {
-                NativeBridge.endLiveStroke()
-            }
+            queueEvent { NativeBridge.endLiveStroke() }
         }
     )
     // 视图缩放手势检测器
@@ -70,7 +70,9 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
                 currentScale = newScale
 
                 // 仅更新视图变换参数，避免在 Kotlin 层做任何重建/重采样
-                NativeBridge.setViewTransform(currentScale, translateX, translateY)
+                queueEvent {
+                    NativeBridge.setViewTransform(currentScale, translateX, translateY)
+                }
                 onViewScaleChanged?.invoke(currentScale)
             }
             return true
@@ -79,7 +81,7 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
             queueEvent {
                 NativeBridge.setInteractionState(true, System.currentTimeMillis())
                 // 缩放手势进行中启用低LOD：显著降低每条笔划参与渲染的点数，优先保证交互流畅
-                NativeBridge.setRenderMaxPoints(256)
+                NativeBridge.setRenderMaxPoints(512)
             }
             return true
         }

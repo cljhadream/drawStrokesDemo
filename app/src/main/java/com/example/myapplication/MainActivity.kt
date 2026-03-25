@@ -93,9 +93,9 @@ class MainActivity : ComponentActivity() {
         val h = dm.heightPixels.toFloat()
         
         // 生成10万条线条，用于测试性能
-        val totalStrokeCount = 10 //100000
+        val totalStrokeCount = 1000 //100000
         val pointsPerStroke = 1024
-        val batchSize = 5000 // 每批5000条线，避免内存溢出
+        val batchSize = 1000 // 每批处理条数，避免内存峰值过高
         val totalBatches = (totalStrokeCount + batchSize - 1) / batchSize
         
         Log.i("MainActivity", "开始生成 $totalStrokeCount 条测试线条，分 $totalBatches 批处理...")
