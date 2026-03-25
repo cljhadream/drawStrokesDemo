@@ -121,6 +121,19 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
         input.currentType = if (type == 1) 1 else 0
     }
 
+    fun setTailRollbackK(k: Int) {
+        input.tailRollbackK = k
+    }
+
+    fun clearCanvas() {
+        queueEvent { NativeBridge.clearStrokes() }
+        requestRender()
+    }
+
+    fun setStrokeBaseWidthPx(px: Float) {
+        queueEvent { NativeBridge.setStrokeBaseWidthPx(px) }
+    }
+
     fun setOnViewScaleChangedListener(listener: ((Float) -> Unit)?) {
         onViewScaleChanged = listener
         onViewScaleChanged?.invoke(currentScale)

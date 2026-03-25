@@ -83,6 +83,7 @@ static std::atomic<int> gFallbackFirstFrameLogOnce{1};
 static bool gUseFramebufferFetch = false;
 static bool gUseFramebufferFetchEXT = false;
 static int gGestureStartStrokeId = -1;
+static int gLiveStrokeId = -1;
 static int gDarkenStrokeCount = 0;
 static int gVisibleIndexCapacity = 0;
 static int gVisibleCount = 0;
@@ -149,6 +150,7 @@ static StrokeMetaCPU gLiveMeta;
 static StrokeBoundsCPU gLiveBounds{0.0f, 0.0f, 0.0f, 0.0f};
 static bool gHasLiveBounds = false;
 static float gLiveColor[4] = {0.1f, 0.4f, 1.0f, 0.85f};
+static float gStrokeBaseWidthPx = 1.0f;
 
 // 当GL程序尚未就绪时暂存的笔划，待初始化完成后统一上传
 struct PendingStroke {
@@ -898,7 +900,8 @@ static void updateVisibleListIfNeeded() {
         }
         if (gLiveActive && gLiveMeta.count > 0) {
             uint32_t lod = (uint32_t)std::min(std::min(gLiveMeta.count, 1024), globalMax);
-            items.push_back(VisibleItem{(uint32_t)committed, lod, 0.0f});
+                uint32_t liveId = gLiveStrokeId >= 0 ? (uint32_t)gLiveStrokeId : (uint32_t)committed;
+                items.push_back(VisibleItem{liveId, lod, 0.0f});
         }
     } else {
         int boundsN = (int)gBounds.size();
@@ -958,7 +961,8 @@ static void updateVisibleListIfNeeded() {
                 score = extent / (dist + 1.0f);
             }
             if (vis && lodLive > 0) {
-                items.push_back(VisibleItem{(uint32_t)committed, (uint32_t)lodLive, score});
+                uint32_t liveId = gLiveStrokeId >= 0 ? (uint32_t)gLiveStrokeId : (uint32_t)committed;
+                items.push_back(VisibleItem{liveId, (uint32_t)lodLive, score});
             }
         }
     }
@@ -1009,7 +1013,7 @@ static void uploadStroke(const std::vector<float>& pts,
             LOGE("Fallback: write points failed, strokeId=%d", strokeId);
             return;
         }
-        if (!writeFallbackMeta(strokeId, N, 16.0f, 0.0f, (float)type, c, b.minX, b.minY, spanX, spanY)) {
+        if (!writeFallbackMeta(strokeId, N, gStrokeBaseWidthPx, 0.0f, (float)type, c, b.minX, b.minY, spanX, spanY)) {
             LOGE("Fallback: write meta failed, strokeId=%d", strokeId);
             return;
         }
@@ -1066,7 +1070,7 @@ static void uploadStroke(const std::vector<float>& pts,
     StrokeMetaCPU meta;
     meta.start = start;
     meta.count = N;
-    meta.baseWidth = 16.0f;
+    meta.baseWidth = gStrokeBaseWidthPx;
     meta.pad = 0.0f;
     meta.color[0] = col[0]; meta.color[1] = col[1]; meta.color[2] = col[2]; meta.color[3] = col[3];
     meta.type = (float)type;
@@ -1108,8 +1112,8 @@ static const char* kVS = R"(#version 310 es
 //
 // 视图变换：
 // - 坐标：screen = positions * uViewScale + uViewTranslate
-// - 宽度：跟随视图缩放，实现缩放时笔迹粗细等比变化：
-//         radius = baseWidth * pressure * 0.5 * uViewScale
+// - 宽度：不随视图缩放，保证缩放时笔迹物理粗细不变：
+//         radius = baseWidth * pressure * 0.5
 //
 // LOD（缩放手势期间降采样）：
 // - uRenderMaxPoints 控制每条笔划参与绘制的最大采样点数。
@@ -1244,8 +1248,8 @@ void main() {
     vec2 dirEnd = safeNormalize(pNScreen - pN1Screen);
     vec2 nStart = vec2(-dirStart.y, dirStart.x);
     vec2 nEnd = vec2(-dirEnd.y, dirEnd.x);
-    float r0 = metas[strokeId].baseWidth * loadPressure(start) * 0.5 * uViewScale;
-    float rN = metas[strokeId].baseWidth * loadPressure(start + lastPointIdx) * 0.5 * uViewScale;
+    float r0 = metas[strokeId].baseWidth * loadPressure(start) * 0.5;
+    float rN = metas[strokeId].baseWidth * loadPressure(start + lastPointIdx) * 0.5;
 
     int vid = gl_VertexID;
     bool degenerateTail = false;
@@ -1308,7 +1312,7 @@ void main() {
         vec2 pCurScreen = positions[idx] * uViewScale + uViewTranslate;
         float pressure = loadPressure(idx);
         // 修复：笔身宽度也需要随视图缩放，否则会变成细线
-        float radius = metas[strokeId].baseWidth * pressure * 0.5 * uViewScale;
+        float radius = metas[strokeId].baseWidth * pressure * 0.5;
 
         int prevSampleIdx = max(pointIdx - 1, 0);
         int nextSampleIdx = min(pointIdx + 1, maxPoints - 1);
@@ -1899,8 +1903,8 @@ void main() {
     vec2 dirEnd = safeNormalize(pNScreen - pN1Screen);
     vec2 nStart = vec2(-dirStart.y, dirStart.x);
     vec2 nEnd = vec2(-dirEnd.y, dirEnd.x);
-    float r0 = baseWidth * p0w.z * 0.5 * uViewScale;
-    float rN = baseWidth * pNw.z * 0.5 * uViewScale;
+    float r0 = baseWidth * p0w.z * 0.5;
+    float rN = baseWidth * pNw.z * 0.5;
 
     int vid = gl_VertexID;
     bool degenerateTail = false;
@@ -1957,7 +1961,7 @@ void main() {
         vec3 pCurW = readPoint(strokeId, clampedPoint, mbounds);
         vec2 pCurScreen = pCurW.xy * uViewScale + uViewTranslate;
         float pressure = pCurW.z;
-        float radius = baseWidth * pressure * 0.5 * uViewScale;
+        float radius = baseWidth * pressure * 0.5;
 
         int prevSampleIdx = max(pointIdx - 1, 0);
         int nextSampleIdx = min(pointIdx + 1, maxPoints - 1);
@@ -2639,15 +2643,50 @@ Java_com_example_myapplication_NativeBridge_setRenderMaxPoints(JNIEnv* env, jobj
 }
 
 JNIEXPORT void JNICALL
+Java_com_example_myapplication_NativeBridge_setStrokeBaseWidthPx(JNIEnv* env, jobject /*thiz*/, jfloat px) {
+    (void)env;
+    gStrokeBaseWidthPx = std::max((float)px, 0.1f);
+    if (gLiveActive) {
+        gLiveMeta.baseWidth = gStrokeBaseWidthPx;
+        if (gUseSSBO && gStrokeMetaSSBO && gLiveStrokeId >= 0) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, gStrokeMetaSSBO);
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                            (GLintptr)(gLiveStrokeId * (int)sizeof(StrokeMetaCPU)),
+                            (GLsizeiptr)sizeof(StrokeMetaCPU),
+                            &gLiveMeta);
+        }
+    }
+    gVisibleDirty.store(1);
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_myapplication_NativeBridge_clearStrokes(JNIEnv* env, jobject /*thiz*/) {
+    (void)env;
+    gPendingStrokes.clear();
+    gMetas.clear();
+    gBounds.clear();
+    gDarkenStrokeCount = 0;
+    gGestureStartStrokeId = -1;
+    gLiveActive = false;
+    gLiveStrokeId = -1;
+    gLiveMeta.count = 0;
+    gHasLiveBounds = false;
+    gFallbackStrokeCount.store(0);
+    gVisibleDirty.store(1);
+    resetProgress();
+}
+
+JNIEXPORT void JNICALL
 Java_com_example_myapplication_NativeBridge_beginLiveStroke(JNIEnv* env, jobject /*thiz*/, jfloatArray color, jint type) {
     if (env && color && env->GetArrayLength(color) >= 4) {
         env->GetFloatArrayRegion(color, 0, 4, gLiveColor);
     }
     gLiveActive = true;
     gGestureStartStrokeId = gUseSSBO ? (int)gMetas.size() : -1;
+    gLiveStrokeId = gUseSSBO ? (int)gMetas.size() : gFallbackStrokeCount.load();
     gLiveMeta.start = 0;
     gLiveMeta.count = 0;
-    gLiveMeta.baseWidth = 16.0f;
+    gLiveMeta.baseWidth = gStrokeBaseWidthPx;
     gLiveMeta.pad = 0.0f;
     gLiveMeta.color[0] = gLiveColor[0];
     gLiveMeta.color[1] = gLiveColor[1];
@@ -2664,7 +2703,7 @@ Java_com_example_myapplication_NativeBridge_beginLiveStroke(JNIEnv* env, jobject
         int liveId = gFallbackStrokeCount.load();
         if (liveId < 0) liveId = 0;
         if (!ensureFallbackStorageCapacity(liveId + 1)) return;
-        writeFallbackMeta(liveId, 0, 16.0f, 0.0f, (float)type, gLiveColor, 0.0f, 0.0f, 0.0f, 0.0f);
+        writeFallbackMeta(liveId, 0, gStrokeBaseWidthPx, 0.0f, (float)type, gLiveColor, 0.0f, 0.0f, 0.0f, 0.0f);
     }
 }
 
@@ -2696,11 +2735,11 @@ Java_com_example_myapplication_NativeBridge_updateLiveStroke(JNIEnv* env, jobjec
         float spanX = b.maxX - b.minX;
         float spanY = b.maxY - b.minY;
         writeFallbackPoints(liveId, pts.data(), prs.data(), N, b.minX, b.minY, spanX, spanY);
-        writeFallbackMeta(liveId, N, 16.0f, 0.0f, gLiveMeta.type, gLiveColor, b.minX, b.minY, spanX, spanY);
+        writeFallbackMeta(liveId, N, gStrokeBaseWidthPx, 0.0f, gLiveMeta.type, gLiveColor, b.minX, b.minY, spanX, spanY);
         return;
     }
 
-    int strokeId = (int)gMetas.size();
+    int strokeId = gLiveStrokeId >= 0 ? gLiveStrokeId : (int)gMetas.size();
     ensureCapacityForStrokes((size_t)strokeId + 1u);
     int start = strokeId * kMaxPointsPerStroke;
 
@@ -2735,7 +2774,7 @@ Java_com_example_myapplication_NativeBridge_updateLiveStroke(JNIEnv* env, jobjec
     StrokeMetaCPU meta;
     meta.start = start;
     meta.count = N;
-    meta.baseWidth = 16.0f;
+    meta.baseWidth = gStrokeBaseWidthPx;
     meta.pad = 0.0f;
     meta.color[0] = gLiveColor[0];
     meta.color[1] = gLiveColor[1];
@@ -2783,11 +2822,11 @@ Java_com_example_myapplication_NativeBridge_updateLiveStrokeWithCount(JNIEnv* en
         float spanX = b.maxX - b.minX;
         float spanY = b.maxY - b.minY;
         writeFallbackPoints(liveId, pts.data(), prs.data(), N, b.minX, b.minY, spanX, spanY);
-        writeFallbackMeta(liveId, N, 16.0f, 0.0f, gLiveMeta.type, gLiveColor, b.minX, b.minY, spanX, spanY);
+        writeFallbackMeta(liveId, N, gStrokeBaseWidthPx, 0.0f, gLiveMeta.type, gLiveColor, b.minX, b.minY, spanX, spanY);
         return;
     }
 
-    int strokeId = (int)gMetas.size();
+    int strokeId = gLiveStrokeId >= 0 ? gLiveStrokeId : (int)gMetas.size();
     ensureCapacityForStrokes((size_t)strokeId + 1u);
     int start = strokeId * kMaxPointsPerStroke;
 
@@ -2822,7 +2861,7 @@ Java_com_example_myapplication_NativeBridge_updateLiveStrokeWithCount(JNIEnv* en
     StrokeMetaCPU meta;
     meta.start = start;
     meta.count = N;
-    meta.baseWidth = 16.0f;
+    meta.baseWidth = gStrokeBaseWidthPx;
     meta.pad = 0.0f;
     meta.color[0] = gLiveColor[0];
     meta.color[1] = gLiveColor[1];
@@ -2850,6 +2889,7 @@ Java_com_example_myapplication_NativeBridge_endLiveStroke(JNIEnv* env, jobject /
         gLiveActive = false;
         gLiveMeta.count = 0;
         gHasLiveBounds = false;
+        gLiveStrokeId = -1;
         gVisibleDirty.store(1);
         return;
     }
@@ -2879,6 +2919,7 @@ Java_com_example_myapplication_NativeBridge_endLiveStroke(JNIEnv* env, jobject /
     gLiveActive = false;
     gLiveMeta.count = 0;
     gHasLiveBounds = false;
+    gLiveStrokeId = -1;
     gVisibleDirty.store(1);
 }
 
@@ -3057,9 +3098,9 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
                 float spanX = b.maxX - b.minX;
                 float spanY = b.maxY - b.minY;
                 writeFallbackPoints(strokeId, pxy, prsPtr + (size_t)pri, n, b.minX, b.minY, spanX, spanY);
-                writeFallbackMeta(strokeId, n, 16.0f, 0.0f, t, c, b.minX, b.minY, spanX, spanY);
+                writeFallbackMeta(strokeId, n, gStrokeBaseWidthPx, 0.0f, t, c, b.minX, b.minY, spanX, spanY);
             } else {
-                writeFallbackMeta(strokeId, n, 16.0f, 0.0f, t, c, 0.0f, 0.0f, 0.0f, 0.0f);
+                writeFallbackMeta(strokeId, n, gStrokeBaseWidthPx, 0.0f, t, c, 0.0f, 0.0f, 0.0f, 0.0f);
             }
             pi += nSafe * 2;
             pri += nSafe;
@@ -3171,7 +3212,7 @@ Java_com_example_myapplication_NativeBridge_addStrokeBatch(JNIEnv* env, jobject 
         StrokeMetaCPU m;
         m.start = (startId + s) * kMaxPointsPerStroke;
         m.count = n;
-        m.baseWidth = 16.0f;
+        m.baseWidth = gStrokeBaseWidthPx;
         m.pad = 0.0f;
         m.color[0] = colsFlat[s * 4 + 0];
         m.color[1] = colsFlat[s * 4 + 1];

@@ -84,9 +84,31 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(replayButton, replayParams)
 
+        val clearButton = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            setBackgroundColor(0x80000000.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            val pad = dpToPx(8f)
+            setPadding(pad, pad, pad, pad)
+            text = "清屏"
+            setOnClickListener {
+                glView.clearCanvas()
+            }
+        }
+        val clearParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dpToPx(12f)
+        }
+        root.addView(clearButton, clearParams)
+
         glView.setOnViewScaleChangedListener { scale ->
             scaleLabel.text = "${(scale * 100f).roundToInt()}%"
         }
+
+        glView.setStrokeBaseWidthPx(dpToPxF(1f))
 
         setContentView(root)
         Log.d("MainActivity", "Content view set")
@@ -316,5 +338,13 @@ class MainActivity : ComponentActivity() {
             dp,
             resources.displayMetrics
         ).roundToInt()
+    }
+
+    private fun dpToPxF(dp: Float): Float {
+        return TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            dp,
+            resources.displayMetrics
+        )
     }
 }

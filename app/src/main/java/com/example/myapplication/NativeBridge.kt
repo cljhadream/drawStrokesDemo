@@ -51,6 +51,10 @@ object NativeBridge {
 
     external fun isUsingSSBO(): Boolean
 
+    external fun clearStrokes()
+
+    external fun setStrokeBaseWidthPx(px: Float)
+
     external fun updateFallbackImage(rgba: ByteArray, width: Int, height: Int)
 
     fun updateFallbackBitmap(bitmap: Bitmap) {
