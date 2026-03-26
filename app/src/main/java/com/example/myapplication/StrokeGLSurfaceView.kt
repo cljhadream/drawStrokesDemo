@@ -38,6 +38,7 @@ class StrokeGLSurfaceView(context: Context) : GLSurfaceView(context) {
             floatArrayOf((x - translateX) * inv, (y - translateY) * inv)
         },
         scaleProvider = { currentScale },
+        viewSizeProvider = { Pair(width, height) },
         jniSubmit = { points, pressures, color, type ->
             queueEvent { batcher.enqueue(points, pressures, color, type) }
         },
