@@ -91,6 +91,9 @@ class StrokeInputProcessor(
     private val tmpPressuresBuf = FloatArray(maxPoints)
     private var liveCount = 0
 
+    private val shortStrokeBypassMaxAnchors = 6
+    private val shortStrokeBypassMaxLengthPx = 24f
+
     /**
      * 尾段回滚窗口大小 K（可调）。
      * - K 越大：末端可回修范围越大，实时曲线更顺，但“回修感”也更明显
@@ -165,6 +168,19 @@ class StrokeInputProcessor(
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                val historySize = ev.historySize
+                for (i in 0 until historySize) {
+                    val hX = ev.getHistoricalX(i)
+                    val hY = ev.getHistoricalY(i)
+                    val hP = sampleHistoricalPressure(ev, i)
+                    val hXy = screenToWorld(hX, hY)
+                    val hWorldX = hXy[0]
+                    val hWorldY = hXy[1]
+                    rawPoints.add(PointF(hWorldX, hWorldY))
+                    rawPressures.add(hP)
+                    ingestRawPointToTwoSegment(PointF(hWorldX, hWorldY), hP)
+                }
+                
                 rawPoints.add(PointF(x, y))
                 rawPressures.add(p)
                 ingestRawPointToTwoSegment(PointF(x, y), p)
@@ -270,21 +286,34 @@ class StrokeInputProcessor(
         val baseScale = (scale / toBase).coerceAtLeast(1e-6f)
         val anchorsBase = ArrayList<PointF>(anchors.size)
         for (p in anchors) anchorsBase.add(PointF(p.x * toBase, p.y * toBase))
+        val baseLengthScreen = polylineLength(anchorsBase) * baseScale
         val stepBase = computeDesiredStepWorld(
             anchors = anchorsBase,
             scale = baseScale,
             targetPoints = 1000,
             maxPointsCap = (maxPoints - 2).coerceAtLeast(8)
         )
-        var countBase = resampleQuadSplineIntoBuffers(
-            anchors = anchorsBase,
-            anchorPressures = pressures,
-            stepWorld = stepBase,
-            outPoints = tmpPointsBuf,
-            outPressures = tmpPressuresBuf,
-            maxOutPoints = maxPoints
-        )
-        if (enableBusinessSecondBezierFit && countBase >= 2) {
+        val bypassResampleForShortStroke =
+            anchorsBase.size <= shortStrokeBypassMaxAnchors && baseLengthScreen <= shortStrokeBypassMaxLengthPx
+        var countBase = if (bypassResampleForShortStroke) {
+            copyAnchorsToBuffers(
+                anchors = anchorsBase,
+                pressures = pressures,
+                outPoints = tmpPointsBuf,
+                outPressures = tmpPressuresBuf,
+                maxOutPoints = maxPoints
+            )
+        } else {
+            resampleQuadSplineIntoBuffers(
+                anchors = anchorsBase,
+                anchorPressures = pressures,
+                stepWorld = stepBase,
+                outPoints = tmpPointsBuf,
+                outPressures = tmpPressuresBuf,
+                maxOutPoints = maxPoints
+            )
+        }
+        if (enableBusinessSecondBezierFit && !bypassResampleForShortStroke && countBase >= 2) {
             countBase = resampleCubicBezierSecondFitIntoBuffers(
                 inPoints = tmpPointsBuf,
                 inPressures = tmpPressuresBuf,
@@ -331,22 +360,35 @@ class StrokeInputProcessor(
         val baseScale = (scale / toBase).coerceAtLeast(1e-6f)
         val anchorsBase = ArrayList<PointF>(anchors.size)
         for (p in anchors) anchorsBase.add(PointF(p.x * toBase, p.y * toBase))
+        val baseLengthScreen = polylineLength(anchorsBase) * baseScale
         val stepBase = computeDesiredStepWorld(
             anchors = anchorsBase,
             scale = baseScale,
             targetPoints = 1000,
             maxPointsCap = null
         )
-        var countBase = resampleQuadSplineIntoBuffers(
-            anchors = anchorsBase,
-            anchorPressures = pressures,
-            stepWorld = stepBase,
-            outPoints = tmpPointsBuf,
-            outPressures = tmpPressuresBuf,
-            maxOutPoints = maxPoints
-        )
+        val bypassResampleForShortStroke =
+            anchorsBase.size <= shortStrokeBypassMaxAnchors && baseLengthScreen <= shortStrokeBypassMaxLengthPx
+        var countBase = if (bypassResampleForShortStroke) {
+            copyAnchorsToBuffers(
+                anchors = anchorsBase,
+                pressures = pressures,
+                outPoints = tmpPointsBuf,
+                outPressures = tmpPressuresBuf,
+                maxOutPoints = maxPoints
+            )
+        } else {
+            resampleQuadSplineIntoBuffers(
+                anchors = anchorsBase,
+                anchorPressures = pressures,
+                stepWorld = stepBase,
+                outPoints = tmpPointsBuf,
+                outPressures = tmpPressuresBuf,
+                maxOutPoints = maxPoints
+            )
+        }
         if (countBase < 2) return
-        if (enableBusinessSecondBezierFit) {
+        if (enableBusinessSecondBezierFit && !bypassResampleForShortStroke) {
             countBase = resampleCubicBezierSecondFitIntoBuffers(
                 inPoints = tmpPointsBuf,
                 inPressures = tmpPressuresBuf,
@@ -440,12 +482,6 @@ class StrokeInputProcessor(
             outCount++
         }
 
-        fun clampIndex(i: Int): Int = when {
-            i < 0 -> 0
-            i >= inCount -> inCount - 1
-            else -> i
-        }
-
         fun bezierPoint(t: Float, p0: PointF, p1: PointF, p2: PointF, p3: PointF): PointF {
             val u = 1f - t
             val tt = t * t
@@ -466,42 +502,113 @@ class StrokeInputProcessor(
             return PointF(x, y)
         }
 
+        // 识别锐角拐点，将其拆分为多个子段，避免 Catmull-Rom 在拐点处平滑
+        val subStrokes = mutableListOf<Pair<Int, Int>>() // startIndex, endIndex (inclusive)
+        var startIndex = 0
+        val cornerCosThreshold = 0.5f
+
+        fun getLookaheadPointIdx(idx: Int, forward: Boolean, minD: Float): Int {
+            val p0x = inPoints[idx * 2]
+            val p0y = inPoints[idx * 2 + 1]
+            var curr = idx
+            while (if (forward) curr < inCount - 1 else curr > 0) {
+                curr += if (forward) 1 else -1
+                val px = inPoints[curr * 2]
+                val py = inPoints[curr * 2 + 1]
+                val dx = px - p0x
+                val dy = py - p0y
+                if (kotlin.math.hypot(dx.toDouble(), dy.toDouble()) >= minD) {
+                    return curr
+                }
+            }
+            return if (forward) inCount - 1 else 0
+        }
+
+        var totalDist = 0f
+        for (i in 1 until inCount) {
+            val dx = inPoints[i * 2] - inPoints[(i - 1) * 2]
+            val dy = inPoints[i * 2 + 1] - inPoints[(i - 1) * 2 + 1]
+            totalDist += kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        }
+        val avgDist = if (inCount > 1) totalDist / (inCount - 1) else 1f
+        val lookaheadDist = kotlin.math.max(avgDist * 2.5f, 1e-2f)
+
+        for (i in 1 until inCount - 1) {
+            val i0 = getLookaheadPointIdx(i, false, lookaheadDist)
+            val i2 = getLookaheadPointIdx(i, true, lookaheadDist)
+            
+            val p0x = inPoints[i0 * 2]
+            val p0y = inPoints[i0 * 2 + 1]
+            val p1x = inPoints[i * 2]
+            val p1y = inPoints[i * 2 + 1]
+            val p2x = inPoints[i2 * 2]
+            val p2y = inPoints[i2 * 2 + 1]
+
+            val ax = p1x - p0x
+            val ay = p1y - p0y
+            val bx = p2x - p1x
+            val by = p2y - p1y
+
+            val la = kotlin.math.hypot(ax.toDouble(), ay.toDouble()).toFloat()
+            val lb = kotlin.math.hypot(bx.toDouble(), by.toDouble()).toFloat()
+
+            if (la > 1e-3f && lb > 1e-3f) {
+                val cosAngle = (ax * bx + ay * by) / (la * lb)
+                if (cosAngle < cornerCosThreshold) { // 发现锐角拐点
+                    subStrokes.add(Pair(startIndex, i))
+                    startIndex = i
+                }
+            }
+        }
+        subStrokes.add(Pair(startIndex, inCount - 1))
+
         push(inPoints[0], inPoints[1], inPressures[0])
 
-        for (i in 0 until inCount - 1) {
-            val i0 = clampIndex(i - 1)
-            val i1 = i
-            val i2 = i + 1
-            val i3 = clampIndex(i + 2)
+        for ((startIdx, endIdx) in subStrokes) {
+            val subCount = endIdx - startIdx + 1
+            if (subCount < 2) continue
 
-            val pPrev = PointF(inPoints[i0 * 2], inPoints[i0 * 2 + 1])
-            val p1w = PointF(inPoints[i1 * 2], inPoints[i1 * 2 + 1])
-            val p2w = PointF(inPoints[i2 * 2], inPoints[i2 * 2 + 1])
-            val pNext = PointF(inPoints[i3 * 2], inPoints[i3 * 2 + 1])
+            fun clampSubIndex(i: Int): Int = when {
+                i < startIdx -> startIdx
+                i > endIdx -> endIdx
+                else -> i
+            }
 
-            val b0 = p1w
-            val b1 = PointF(
-                p1w.x + (p2w.x - pPrev.x) / 6f,
-                p1w.y + (p2w.y - pPrev.y) / 6f
-            )
-            val b2 = PointF(
-                p2w.x - (pNext.x - p1w.x) / 6f,
-                p2w.y - (pNext.y - p1w.y) / 6f
-            )
-            val b3 = p2w
+            for (i in startIdx until endIdx) {
+                val i0 = clampSubIndex(i - 1)
+                val i1 = i
+                val i2 = i + 1
+                val i3 = clampSubIndex(i + 2)
 
-            val prA = inPressures[i1]
-            val prB = inPressures[i2]
-            var t = 0f
-            while (t < 1f && outCount < maxOutPoints) {
-                val tan = bezierTangent(t, b0, b1, b2, b3)
-                val len = kotlin.math.hypot(tan.x.toDouble(), tan.y.toDouble()).toFloat()
-                val dt = if (len < 1e-3f) 0.25f else (stepWorld / len).coerceAtMost(0.5f)
-                val tt = (t + dt).coerceAtMost(1f)
-                val p = bezierPoint(tt, b0, b1, b2, b3)
-                val pr = prA + (prB - prA) * tt
-                push(p.x, p.y, pr)
-                t = tt
+                val pPrev = PointF(inPoints[i0 * 2], inPoints[i0 * 2 + 1])
+                val p1w = PointF(inPoints[i1 * 2], inPoints[i1 * 2 + 1])
+                val p2w = PointF(inPoints[i2 * 2], inPoints[i2 * 2 + 1])
+                val pNext = PointF(inPoints[i3 * 2], inPoints[i3 * 2 + 1])
+
+                val b0 = p1w
+                val b1 = PointF(
+                    p1w.x + (p2w.x - pPrev.x) / 6f,
+                    p1w.y + (p2w.y - pPrev.y) / 6f
+                )
+                val b2 = PointF(
+                    p2w.x - (pNext.x - p1w.x) / 6f,
+                    p2w.y - (pNext.y - p1w.y) / 6f
+                )
+                val b3 = p2w
+
+                val prA = inPressures[i1]
+                val prB = inPressures[i2]
+                var t = 0f
+                while (t < 1f && outCount < maxOutPoints) {
+                    val tan = bezierTangent(t, b0, b1, b2, b3)
+                    val len = kotlin.math.hypot(tan.x.toDouble(), tan.y.toDouble()).toFloat()
+                    val dt = if (len < 1e-3f) 0.25f else (stepWorld / len).coerceAtMost(0.5f)
+                    val tt = (t + dt).coerceAtMost(1f)
+                    val p = bezierPoint(tt, b0, b1, b2, b3)
+                    val pr = prA + (prB - prA) * tt
+                    push(p.x, p.y, pr)
+                    t = tt
+                }
             }
         }
 
@@ -531,6 +638,16 @@ class StrokeInputProcessor(
     private fun samplePressure(ev: MotionEvent): Float {
         val p = ev.pressure.coerceIn(0f, 1f)
         val size = ev.size.coerceIn(0f, 1f)
+        val pseudo = (size * 1.6f).coerceIn(0f, 1f)
+        val raw = maxOf(p, pseudo)
+        val filtered = lastPressure * 0.85f + raw * 0.15f
+        lastPressure = filtered
+        return filtered.coerceIn(0.05f, 1f)
+    }
+
+    private fun sampleHistoricalPressure(ev: MotionEvent, pos: Int): Float {
+        val p = ev.getHistoricalPressure(pos).coerceIn(0f, 1f)
+        val size = ev.getHistoricalSize(pos).coerceIn(0f, 1f)
         val pseudo = (size * 1.6f).coerceIn(0f, 1f)
         val raw = maxOf(p, pseudo)
         val filtered = lastPressure * 0.85f + raw * 0.15f
@@ -700,94 +817,151 @@ class StrokeInputProcessor(
     private fun buildQuadSplineSegments(anchors: List<PointF>, prs: List<Float>): List<QuadSeg> {
         val n = anchors.size
         if (n < 2) return emptyList()
-        if (n == 2) {
-            val startAnchor = anchors[0]
-            val endAnchor = anchors[1]
-            val midPoint = PointF((startAnchor.x + endAnchor.x) * 0.5f, (startAnchor.y + endAnchor.y) * 0.5f)
-            val midPressure = (prs[0] + prs[1]) * 0.5f
-            return listOf(QuadSeg(startAnchor, midPoint, endAnchor, prs[0], midPressure, prs[1]))
+
+        // 识别锐角拐点，将锚点序列拆分为多个子段
+        val subStrokes = mutableListOf<Pair<List<PointF>, List<Float>>>()
+        var startIndex = 0
+
+        // 拐点判断阈值：cos 阈值为 0.5f 对应转折角度约 60 度
+        val cornerCosThreshold = 0.5f
+        
+        // 应对高频报点：计算角度时向前后寻找至少相距一定距离的点，避免密集点导致局部角度过大（平缓）
+        // 估算一个合适的最小寻找距离：取整条笔迹平均点距的几倍，或者使用固定的相对距离。
+        // 这里采用累加距离法寻找前后有效参考点
+        fun getLookaheadPoint(idx: Int, forward: Boolean, minD: Float): PointF {
+            val p0 = anchors[idx]
+            var curr = idx
+            while (if (forward) curr < n - 1 else curr > 0) {
+                curr += if (forward) 1 else -1
+                val p = anchors[curr]
+                val dx = p.x - p0.x
+                val dy = p.y - p0.y
+                if (kotlin.math.hypot(dx.toDouble(), dy.toDouble()) >= minD) {
+                    return p
+                }
+            }
+            return anchors[if (forward) n - 1 else 0]
         }
 
-        val mids = ArrayList<PointF>(n - 1)
-        val midPrs = ArrayList<Float>(n - 1)
-        for (i in 0 until n - 1) {
-            val leftAnchor = anchors[i]
-            val rightAnchor = anchors[i + 1]
-            mids.add(PointF((leftAnchor.x + rightAnchor.x) * 0.5f, (leftAnchor.y + rightAnchor.y) * 0.5f))
-            midPrs.add((prs[i] + prs[i + 1]) * 0.5f)
+        // 动态计算近似参考距离（由于是在 base 1000 空间或原始空间，使用相对比例）
+        var totalDist = 0f
+        for (i in 1 until n) {
+            val dx = anchors[i].x - anchors[i - 1].x
+            val dy = anchors[i].y - anchors[i - 1].y
+            totalDist += kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
         }
-
-        fun safeNormalize(dx: Float, dy: Float): Pair<Float, Float> {
-            val len = kotlin.math.sqrt(dx * dx + dy * dy)
-            if (len < 1e-6f) return Pair(0f, 0f)
-            return Pair(dx / len, dy / len)
-        }
-
-        val out = ArrayList<QuadSeg>(n)
-
-        run {
-            val startAnchor = anchors[0]
-            val secondAnchor = anchors[1]
-            val startTangentDir = safeNormalize(secondAnchor.x - startAnchor.x, secondAnchor.y - startAnchor.y)
-            val startHandleLen = kotlin.math.min(
-                distance(startAnchor, secondAnchor) * 0.25f,
-                distance(startAnchor, mids[0]) * 0.9f
-            )
-            // 首段端点切线控制点：
-            // - 以 (second-start) 方向作为端点切线，构造控制点
-            // - handle 做夹紧：既避免控制点过远导致端点“甩尾”，也避免过近导致退化
-            val startControl = PointF(
-                startAnchor.x + startTangentDir.first * startHandleLen,
-                startAnchor.y + startTangentDir.second * startHandleLen
-            )
-            out.add(QuadSeg(startAnchor, startControl, mids[0], prs[0], prs[0], midPrs[0]))
-        }
+        val avgDist = if (n > 1) totalDist / (n - 1) else 1f
+        val lookaheadDist = kotlin.math.max(avgDist * 2.5f, 1e-2f)
 
         for (i in 1 until n - 1) {
-            // 中间段贴点二次曲线：
-            // - p0/p2 使用相邻中点，能保证段与段之间在中点处连续衔接
-            // - p1 直接使用真实锚点，让轨迹尽量贴近用户输入
-            out.add(QuadSeg(mids[i - 1], anchors[i], mids[i], midPrs[i - 1], prs[i], midPrs[i]))
-        }
+            val p0 = getLookaheadPoint(i, false, lookaheadDist)
+            val p1 = anchors[i]
+            val p2 = getLookaheadPoint(i, true, lookaheadDist)
 
-        run {
-            val preEndAnchor = anchors[n - 2]
-            val endAnchor = anchors[n - 1]
-            val endTangentDir = safeNormalize(endAnchor.x - preEndAnchor.x, endAnchor.y - preEndAnchor.y)
-            val endHandleLen = kotlin.math.min(
-                distance(preEndAnchor, endAnchor) * 0.25f,
-                distance(mids[n - 2], endAnchor) * 0.9f
-            )
-            // 尾段端点切线控制点：
-            // - 以 (end-preEnd) 方向作为端点切线，构造控制点（从 end 向回退）
-            // - 这样尾端在实时阶段即便缺少“下一个点”，也能保持更自然的末端走向
-            val endControl = PointF(
-                endAnchor.x - endTangentDir.first * endHandleLen,
-                endAnchor.y - endTangentDir.second * endHandleLen
-            )
-            out.add(QuadSeg(mids[n - 2], endControl, endAnchor, midPrs[n - 2], prs[n - 1], prs[n - 1]))
-        }
+            val ax = p1.x - p0.x
+            val ay = p1.y - p0.y
+            val bx = p2.x - p1.x
+            val by = p2.y - p1.y
 
-        val sanitized = ArrayList<QuadSeg>(out.size)
-        for (seg in out) {
-            val chord = distance(seg.p0, seg.p2)
-            val d01 = distance(seg.p0, seg.p1)
-            // 退化检测：
-            // - 若控制点 seg.p1 极接近 seg.p0（相对弦长过小），该段导数在起点附近可能趋近 0
-            // - 采样时 dt ≈ step/|B'(t)| 会被放大，导致跨过大量参数区间，出现“直线拉过去”的伪影
-            if (chord > 1e-3f && d01 < chord * 0.02f) {
-                val midControl = PointF(
-                    seg.p0.x + (seg.p2.x - seg.p0.x) * 0.5f,
-                    seg.p0.y + (seg.p2.y - seg.p0.y) * 0.5f
-                )
-                // 退化修正：
-                // - 将控制点回退到弦中点，使段形状更稳定，避免导数退化
-                sanitized.add(QuadSeg(seg.p0, midControl, seg.p2, seg.pr0, seg.pr1, seg.pr2))
-            } else {
-                sanitized.add(seg)
+            val la = kotlin.math.hypot(ax.toDouble(), ay.toDouble()).toFloat()
+            val lb = kotlin.math.hypot(bx.toDouble(), by.toDouble()).toFloat()
+
+            if (la > 1e-3f && lb > 1e-3f) {
+                val cosAngle = (ax * bx + ay * by) / (la * lb)
+                // 发现锐角拐点，断开子段
+                if (cosAngle < cornerCosThreshold) {
+                    subStrokes.add(
+                        Pair(
+                            anchors.subList(startIndex, i + 1),
+                            prs.subList(startIndex, i + 1)
+                        )
+                    )
+                    startIndex = i
+                }
             }
         }
-        return sanitized
+        subStrokes.add(Pair(anchors.subList(startIndex, n), prs.subList(startIndex, n)))
+
+        val allSanitized = ArrayList<QuadSeg>(n)
+
+        for ((subAnchors, subPrs) in subStrokes) {
+            val subN = subAnchors.size
+            if (subN < 2) continue
+            if (subN == 2) {
+                val startAnchor = subAnchors[0]
+                val endAnchor = subAnchors[1]
+                val midPoint = PointF((startAnchor.x + endAnchor.x) * 0.5f, (startAnchor.y + endAnchor.y) * 0.5f)
+                val midPressure = (subPrs[0] + subPrs[1]) * 0.5f
+                allSanitized.add(QuadSeg(startAnchor, midPoint, endAnchor, subPrs[0], midPressure, subPrs[1]))
+                continue
+            }
+
+            val mids = ArrayList<PointF>(subN - 1)
+            val midPrs = ArrayList<Float>(subN - 1)
+            for (i in 0 until subN - 1) {
+                val leftAnchor = subAnchors[i]
+                val rightAnchor = subAnchors[i + 1]
+                mids.add(PointF((leftAnchor.x + rightAnchor.x) * 0.5f, (leftAnchor.y + rightAnchor.y) * 0.5f))
+                midPrs.add((subPrs[i] + subPrs[i + 1]) * 0.5f)
+            }
+
+            fun safeNormalize(dx: Float, dy: Float): Pair<Float, Float> {
+                val len = kotlin.math.sqrt(dx * dx + dy * dy)
+                if (len < 1e-6f) return Pair(0f, 0f)
+                return Pair(dx / len, dy / len)
+            }
+
+            val out = ArrayList<QuadSeg>(subN)
+
+            run {
+                val startAnchor = subAnchors[0]
+                val secondAnchor = subAnchors[1]
+                val startTangentDir = safeNormalize(secondAnchor.x - startAnchor.x, secondAnchor.y - startAnchor.y)
+                val startHandleLen = kotlin.math.min(
+                    distance(startAnchor, secondAnchor) * 0.25f,
+                    distance(startAnchor, mids[0]) * 0.9f
+                )
+                val startControl = PointF(
+                    startAnchor.x + startTangentDir.first * startHandleLen,
+                    startAnchor.y + startTangentDir.second * startHandleLen
+                )
+                out.add(QuadSeg(startAnchor, startControl, mids[0], subPrs[0], subPrs[0], midPrs[0]))
+            }
+
+            for (i in 1 until subN - 1) {
+                out.add(QuadSeg(mids[i - 1], subAnchors[i], mids[i], midPrs[i - 1], subPrs[i], midPrs[i]))
+            }
+
+            run {
+                val preEndAnchor = subAnchors[subN - 2]
+                val endAnchor = subAnchors[subN - 1]
+                val endTangentDir = safeNormalize(endAnchor.x - preEndAnchor.x, endAnchor.y - preEndAnchor.y)
+                val endHandleLen = kotlin.math.min(
+                    distance(preEndAnchor, endAnchor) * 0.25f,
+                    distance(mids[subN - 2], endAnchor) * 0.9f
+                )
+                val endControl = PointF(
+                    endAnchor.x - endTangentDir.first * endHandleLen,
+                    endAnchor.y - endTangentDir.second * endHandleLen
+                )
+                out.add(QuadSeg(mids[subN - 2], endControl, endAnchor, midPrs[subN - 2], subPrs[subN - 1], subPrs[subN - 1]))
+            }
+
+            for (seg in out) {
+                val chord = distance(seg.p0, seg.p2)
+                val d01 = distance(seg.p0, seg.p1)
+                if (chord > 1e-3f && d01 < chord * 0.02f) {
+                    val midControl = PointF(
+                        seg.p0.x + (seg.p2.x - seg.p0.x) * 0.5f,
+                        seg.p0.y + (seg.p2.y - seg.p0.y) * 0.5f
+                    )
+                    allSanitized.add(QuadSeg(seg.p0, midControl, seg.p2, seg.pr0, seg.pr1, seg.pr2))
+                } else {
+                    allSanitized.add(seg)
+                }
+            }
+        }
+        return allSanitized
     }
 
     /**
@@ -1246,5 +1420,51 @@ class StrokeInputProcessor(
         val dx = a.x - b.x
         val dy = a.y - b.y
         return kotlin.math.sqrt(dx * dx + dy * dy)
+    }
+
+    private fun polylineLength(points: List<PointF>): Float {
+        if (points.size < 2) return 0f
+        var length = 0f
+        for (i in 1 until points.size) {
+            val a = points[i - 1]
+            val b = points[i]
+            val dx = b.x - a.x
+            val dy = b.y - a.y
+            length += kotlin.math.sqrt(dx * dx + dy * dy)
+        }
+        return length
+    }
+
+    private fun copyAnchorsToBuffers(
+        anchors: List<PointF>,
+        pressures: List<Float>,
+        outPoints: FloatArray,
+        outPressures: FloatArray,
+        maxOutPoints: Int
+    ): Int {
+        if (anchors.isEmpty()) return 0
+        val inCount = kotlin.math.min(anchors.size, pressures.size)
+        if (inCount <= 0) return 0
+
+        if (inCount <= maxOutPoints) {
+            for (i in 0 until inCount) {
+                val p = anchors[i]
+                outPoints[i * 2] = p.x
+                outPoints[i * 2 + 1] = p.y
+                outPressures[i] = pressures[i]
+            }
+            return inCount
+        }
+
+        val outCount = maxOutPoints.coerceAtLeast(2)
+        for (oi in 0 until outCount) {
+            val t = oi.toFloat() / (outCount - 1).toFloat()
+            val si = kotlin.math.floor(t * (inCount - 1).toFloat()).toInt().coerceIn(0, inCount - 1)
+            val p = anchors[si]
+            outPoints[oi * 2] = p.x
+            outPoints[oi * 2 + 1] = p.y
+            outPressures[oi] = pressures[si]
+        }
+        return outCount
     }
 }

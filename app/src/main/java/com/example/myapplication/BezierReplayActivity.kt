@@ -236,24 +236,56 @@ private class BezierReplayView(context: android.content.Context) : View(context)
             return listOf(ReplayQuadSegment(p0 = a, p1 = c, p2 = b))
         }
 
+        // Identify sharp corners based on angle between segments
+        val cornerIndices = BezierReplayCore.buildAnchorIndices(rawScreen, 45f).toSet()
+
         val n = rawScreen.size
-        val mids = ArrayList<ReplayVec2>(n - 1)
-        for (i in 0 until n - 1) {
-            val a = rawScreen[i]
-            val b = rawScreen[i + 1]
+        val out = ArrayList<ReplayQuadSegment>(n)
+        
+        // Split the stroke at corners into independent sub-strokes
+        var startIndex = 0
+        for (i in 1 until n) {
+            if (cornerIndices.contains(i) || i == n - 1) {
+                // Build segments for the sub-stroke [startIndex, i]
+                buildSubStrokeSegments(rawScreen, startIndex, i, out)
+                startIndex = i
+            }
+        }
+        
+        return out
+    }
+
+    private fun buildSubStrokeSegments(
+        rawScreen: List<ReplayVec2>, 
+        start: Int, 
+        end: Int, 
+        out: ArrayList<ReplayQuadSegment>
+    ) {
+        val count = end - start + 1
+        if (count < 2) return
+        if (count == 2) {
+            val a = rawScreen[start]
+            val b = rawScreen[end]
+            val c = ReplayVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f)
+            out.add(ReplayQuadSegment(p0 = a, p1 = c, p2 = b))
+            return
+        }
+
+        val mids = ArrayList<ReplayVec2>(count - 1)
+        for (i in 0 until count - 1) {
+            val a = rawScreen[start + i]
+            val b = rawScreen[start + i + 1]
             mids.add(ReplayVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f))
         }
 
-        val out = ArrayList<ReplayQuadSegment>(n)
-        out.add(ReplayQuadSegment(p0 = rawScreen[0], p1 = rawScreen[0], p2 = mids[0]))
-        for (i in 1 until n - 1) {
+        out.add(ReplayQuadSegment(p0 = rawScreen[start], p1 = rawScreen[start], p2 = mids[0]))
+        for (i in 1 until count - 1) {
             val p0 = mids[i - 1]
-            val p1 = rawScreen[i]
+            val p1 = rawScreen[start + i]
             val p2 = mids[i]
             out.add(ReplayQuadSegment(p0 = p0, p1 = p1, p2 = p2))
         }
-        out.add(ReplayQuadSegment(p0 = mids[n - 2], p1 = rawScreen[n - 1], p2 = rawScreen[n - 1]))
-        return out
+        out.add(ReplayQuadSegment(p0 = mids[count - 2], p1 = rawScreen[end], p2 = rawScreen[end]))
     }
 
     private fun denoiseStroke(points: List<ReplayVec2>): List<ReplayVec2> {
